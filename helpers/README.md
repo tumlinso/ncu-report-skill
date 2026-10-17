@@ -17,8 +17,13 @@ cp "$HELPERS/harness_template.cu" my_kernel_harness.cu
 cp "$HELPERS/safetensors_loader.h" .
 # edit my_kernel_harness.cu to include your kernel + fill in main()
 nvcc -O2 -std=c++17 -lineinfo -arch=sm_100a \
-     my_kernel_harness.cu -o my_kernel_harness     # sm_100a: B200, sm_103a: B300
+     my_kernel_harness.cu -o my_kernel_harness     # e.g. sm_100a: B200, sm_103a: B300
 ```
+
+For Volta, compile a separate target build with `-arch=sm_70` and use Nsight
+Compute 2025.2.x. Select the target architecture and matching NCU release for
+the GPU being profiled. See [`../reference/02-harness-guide.md`](../reference/02-harness-guide.md)
+and [`../reference/10-volta.md`](../reference/10-volta.md).
 
 ## Python
 
@@ -27,12 +32,13 @@ nvcc -O2 -std=c++17 -lineinfo -arch=sm_100a \
 | `ncu_utils.py` | Shared helpers: finds `ncu_report`, `load_report` / `select_actions` (every kernel of a report), `kernel_name`, `safe`, `per_pc_values`, `KEY_METRICS`, `rule_speedups`, `pm_series_names`, `inline_chains`, ... `python3 ncu_utils.py` prints where `ncu_report` was found |
 | `analyze_reports.py` | Key metrics, NCU rule results (by estimated speedup) and side-by-side comparison from one or more `.ncu-rep`s |
 | `extract_stall_hotspots.py` | Aggregate per-PC stall samples → per-source-line rankings; `--binary` ranks the kernel function's own lines for inlined (CUTLASS/CuTe) code |
-| `plot_timeline.py` | ASCII plot PM sampling timelines (reveals tail effect, pipeline bubbles); `--list` shows a report's series |
+| `plot_timeline.py` | ASCII plot PM-sampling timelines when the GPU/report supports them; `--list` shows available series. Volta has no PM timeline; other analyses remain usable. |
 | `list_flashinfer_workloads.py` | Browse a flashinfer-trace dataset: show axes, histogram workload shapes, print safetensors paths for specific UUIDs |
 
 ### Typical Python workflow
 
 ```bash
+export NCU="${NCU:-ncu}"  # keep the selected profiler consistent for helpers
 export FIB_DATASET_PATH=<flashinfer-trace dataset root>  # if using FIB workloads
 
 # (Optional) Browse workload shapes for a flashinfer-trace dataset
@@ -56,4 +62,4 @@ python3 "$HELPERS/plot_timeline.py" --run-dir "$PROFILE_RUN_DIR" \
 
 The three report scripts take `--run-dir` and write under `<run-dir>/analysis/`. A report holding several kernels gives one output per kernel (`<tag>.<i>_<function>`); `--kernel REGEX` keeps the matching ones. None of them needs a GPU.
 
-`ncu_utils.py` finds `ncu_report` from the `ncu` on PATH, the way the CUDA toolkit's `ncu` launcher finds Nsight Compute. If `ncu` is not on PATH, put `<Nsight Compute install>/extras/python` on `PYTHONPATH`.
+`ncu_utils.py` uses normal Python import resolution first, including `PYTHONPATH`, then discovers bindings associated with the selected profiler. Set `NCU` to choose an executable when several are installed. Set `NCU_REPORT_PYTHON_PATH` to an `extras/python` directory when the bindings are stored outside discoverable layouts; this explicit path takes precedence over automatic discovery. See [`../reference/04-python-api.md`](../reference/04-python-api.md) for setup and API capability notes.

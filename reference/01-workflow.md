@@ -41,8 +41,9 @@ If any of 1-4 are unclear, settle them before profiling: ask whoever set the tas
 Steps 2 and 5, and every later `ncu` collection, need the GPU; run them where your environment runs GPU commands (see "Where the GPU is" in [`../SKILL.md`](../SKILL.md)). The rest runs anywhere.
 
 ```bash
-# 1. ncu CLI is available
-ncu --version   # this skill is written against Nsight Compute 2026.3 (CUDA 13.2 bundles 2026.1.1)
+# 1. Select a profiler supporting the target (2025.2.x for Volta).
+export NCU="${NCU:-ncu}"
+"$NCU" --version
 
 # 2. GPU is visible, and which one (the compute capability picks the -arch, 02-harness-guide.md)
 nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv
@@ -50,12 +51,12 @@ nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv
 # 3. CUDA compiler is available
 nvcc --version  # CUDA Toolkit, used for -lineinfo builds
 
-# 4. ncu_report Python module (parses reports): the helpers find it from the ncu on PATH
+# 4. ncu_report Python module: the helpers use Python imports, then selected-install discovery
 python3 <skill>/helpers/ncu_utils.py     # prints where ncu_report was found
 
-# 5. Permissions. ncu usually works without sudo (RestrictProfilingToAdminUsers is 0
-#    by default). If you see ERR_NVGPUCTRPERM, see 09-common-issues.md.
-ncu --section SpeedOfLight -c 1 <any command that launches a kernel>
+# 5. Counter permissions depend on the host driver configuration.
+#    If you see ERR_NVGPUCTRPERM, see 09-common-issues.md.
+"$NCU" --section SpeedOfLight -c 1 <any command that launches a kernel>
 ```
 
 `<skill>` is this skill's directory. Set a writable `HOME` before running ncu if yours is not, to silence the "Could not deploy stock section files" warning.
@@ -83,14 +84,15 @@ Either way, **the kernel must carry line info**. Without it, source-level analys
 One `ncu` invocation per (kernel, dispatch path, representative workload) — **outputs go under `$PROFILE_RUN_DIR/reports/`**. Details in [`03-collection.md`](03-collection.md).
 
 ```bash
-ncu --set full --import-source yes \
+export NCU="${NCU:-ncu}"
+"$NCU" --set full --import-source yes \
     -k "regex:YOUR_KERNEL_NAME" \
     -c 1 \
     -o "$PROFILE_RUN_DIR/reports/full_<tag>.ncu-rep" \
     "$PROFILE_RUN_DIR/harness/your_harness" [args]
 ```
 
-`--set full` holds every section the helpers read, including the per-PC stall samples (SourceCounters) and the PM-sampling timelines and timed warp samples (PmSampling). Name the output with its `.ncu-rep` extension: without one, ncu 2026.3 writes `.ncu-repz`. A `--set full` run replays the kernel about 50 times: seconds for a short kernel, minutes for a long one. Plan your time budget.
+`--set full` requests the profiler's standard sections, including SourceCounters and PM sampling where the selected GPU and profiler support them. Volta has no PM timeline for this workflow; continue with available analyses and mark the timeline unavailable. Name the output with its `.ncu-rep` extension. A full run may replay the kernel many times; plan the collection time.
 
 ---
 
@@ -107,7 +109,7 @@ Minimum analysis artifacts to produce:
 | `rules_<tag>.txt` | `analyze_reports.py` | NCU's rule-engine results, highest `Est. Speedup` first |
 | `compare_<a>_vs_<b>.txt` | `analyze_reports.py` | Side-by-side metric comparison between workloads / versions |
 | `stall_hotspots_<tag>.txt` | `extract_stall_hotspots.py` | Top source lines ranked by stall samples (`--binary`: by the kernel's own lines) |
-| `pm_timeline_<tag>.txt` | `plot_timeline.py` | ASCII time-series plots — reveals tail effect visually |
+| `pm_timeline_<tag>.txt` | `plot_timeline.py` | ASCII time-series plots when PM sampling is supported and present |
 | `details_<tag>.txt` | `ncu --import ... --page details` | NCU's details page, as the GUI shows it |
 
 Save everything under `$PROFILE_RUN_DIR/analysis/`. The user will want to re-inspect these; if two runs mix artifacts, you've already failed.
@@ -119,10 +121,10 @@ Save everything under `$PROFILE_RUN_DIR/analysis/`. The user will want to re-ins
 Work through the six analysis dimensions — see [`05-analysis-dimensions.md`](05-analysis-dimensions.md):
 
 1. **SM occupancy & wave structure** — are enough blocks launched to fill the chip? Is occupancy register- / shared-mem- / block-limited?
-2. **Thread-block balance (tail effect)** — do per-SM active cycles match? Does the PM timeline show a clean drop or a gradual tail?
+2. **Thread-block balance (tail effect)** — do supported per-SM balance counters differ? If PM timelines are available, do they show a clean drop or gradual tail? On Volta, timeline shape is unavailable.
 3. **Instruction-level stall analysis** — what stall reason dominates? Which source line generates it?
 4. **Tensor Core utilization** — if this is a GEMM-ish kernel, are tensor cores actually being used?
-5. **SM utilization timeline** — flat high, flat low, periodic waves, gradual tail?
+5. **SM utilization timeline** — when supported, flat high, flat low, periodic waves or gradual tail; otherwise record unavailable.
 6. **Memory access pattern** — sectors/request, L1/L2 hit rates, DRAM throughput, register spill.
 
 For each dimension, write down the observed signal *and the specific metric value* that produced it. "Kernel is memory bound" is useless; something like "`gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed = X%` (well below peak) shows the kernel is *not* DRAM-bandwidth-bound — the `long_scoreboard` stall rate of Y% says it's latency-bound on L1" is diagnosis. Fill in X and Y from your own report.

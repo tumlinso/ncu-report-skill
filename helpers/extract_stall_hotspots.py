@@ -53,6 +53,7 @@ STALL_METRICS = [
     "smsp__pcsamp_warps_issue_stalled_no_instructions",
     "smsp__pcsamp_warps_issue_stalled_selected",
     "smsp__pcsamp_warps_issue_stalled_branch_resolving",
+    "smsp__pcsamp_warps_issue_stalled_imc_miss",
     "smsp__pcsamp_warps_issue_stalled_barrier",
     "smsp__pcsamp_warps_issue_stalled_tex_throttle",
     "smsp__pcsamp_warps_issue_stalled_sleeping",
@@ -61,33 +62,80 @@ STALL_METRICS = [
 ]
 
 
-def collect_per_pc(action):
-    """Return dict[pc] -> dict[stall_name -> count]."""
+def collect_per_pc_result(action):
+    """Return ``(per_pc, status, detail)`` for source stall samples in a report."""
     per_pc = defaultdict(lambda: defaultdict(int))
-    for sn in STALL_METRICS:
+    try:
+        available = set(action.metric_names())
+    except Exception as exc:
+        return per_pc, "error", str(exc)
+    present = [name for name in STALL_METRICS if name in available]
+    if not present:
+        return per_pc, "not_collected", "no per-PC stall metrics are present"
+    correlated = 0
+    instances = 0
+    errors = []
+    for sn in present:
         try:
             m = action[sn]
-        except Exception:
+        except Exception as exc:
+            errors.append(f"{sn}: {exc}")
             continue
         try:
             n = m.num_instances()
-        except Exception:
+        except Exception as exc:
+            errors.append(f"{sn}: {exc}")
             continue
-        if n == 0 or not m.has_correlation_ids():
+        if n == 0:
             continue
-        cor = m.correlation_ids()
+        instances += n
+        try:
+            if not m.has_correlation_ids():
+                continue
+            cor = m.correlation_ids()
+        except Exception as exc:
+            errors.append(f"{sn}: correlation IDs unavailable: {exc}")
+            continue
         for i in range(n):
             try:
                 pc = cor.as_uint64(i)
-            except Exception:
+                if pc is None:
+                    raise ValueError("uint64 PC correlation is unavailable")
+            except Exception as uint_error:
                 try:
                     pc = int(cor.as_double(i))
-                except Exception:
+                except Exception as double_error:
+                    errors.append(
+                        f"{sn}[{i}]: PC correlation unreadable: "
+                        f"{uint_error}; {double_error}"
+                    )
                     continue
-            v = metric_value_at(m, i)
-            if v:
+            try:
+                v = metric_value_at(m, i)
+            except Exception as exc:
+                errors.append(f"{sn}[{i}]: value unreadable: {exc}")
+                continue
+            if v is None:
+                errors.append(f"{sn}[{i}]: value unavailable")
+                continue
+            correlated += 1
+            if v != 0:
                 per_pc[pc][sn] += int(v)
-    return per_pc
+    detail = "; ".join(errors[:3]) or None
+    if per_pc:
+        return per_pc, ("partial" if errors else "available"), detail
+    if errors:
+        return per_pc, "error", detail
+    if not instances:
+        return per_pc, "no_samples", "per-PC stall metrics exist but contain no instances"
+    if not correlated:
+        return per_pc, "no_pc_data", "per-PC stall metrics have no usable PC correlation IDs"
+    return per_pc, "zero_stalls", "correlated stall metrics contain only zero-valued samples"
+
+
+def collect_per_pc(action):
+    """Return dict[pc] -> dict[stall_name -> count], preserving the legacy helper API."""
+    return collect_per_pc_result(action)[0]
 
 
 def _source_line(action, pc):
@@ -112,6 +160,22 @@ def aggregate_by_source_line(action, per_pc):
         for sn, v in stalls.items():
             per_line[(file_, line)][sn] += v
     return per_line
+
+
+def source_line_coverage(action, per_pc):
+    """Count sampled PCs with and without usable source file/line information."""
+    mapped = 0
+    for pc in per_pc:
+        fn, line = _source_line(action, pc)
+        if fn != "?" and line > 0:
+            mapped += 1
+    sampled = len(per_pc)
+    return {
+        "sampled_pcs": sampled,
+        "mapped_pcs": mapped,
+        "unmapped_pcs": sampled - mapped,
+        "status": "unavailable" if mapped == 0 else "partial" if mapped < sampled else "available",
+    }
 
 
 def aggregate_by_kernel_line(per_pc, chains):
@@ -187,9 +251,16 @@ def _write_ranking(f, per_line, top_n):
 
 
 def write_report(per_line, out_path, tag, kernel, top_n=30, kernel_lines=None, alignment=None,
-                 executed=None, kernel_executed=None):
+                 executed=None, kernel_executed=None, source_coverage=None):
     with open(out_path, "w") as f:
         f.write(f"===== Stall hotspots for {tag} =====\nKernel: {kernel}\n")
+        if source_coverage is not None:
+            f.write("Source-line attribution: "
+                    f"{source_coverage['mapped_pcs']}/{source_coverage['sampled_pcs']} "
+                    f"sampled PCs mapped ({source_coverage['status']})\n")
+            if source_coverage["unmapped_pcs"]:
+                f.write("Unmapped PCs have stall samples but no usable source file/line mapping; "
+                        "check that the exact profiled binary includes -lineinfo.\n")
         if kernel_lines is not None:
             checked, mismatched = alignment
             f.write(f"\n===== By line in the kernel function (outermost inline frame, from --binary; "
@@ -232,15 +303,27 @@ def main():
             print(f"[skip] {rep}: no kernel matches {args.kernel!r}", file=sys.stderr)
             continue
         for action, t in zip(acts, action_tags(tag, acts)):
-            per_pc = collect_per_pc(action)
+            per_pc, stall_status, stall_detail = collect_per_pc_result(action)
             if not per_pc:
-                print(f"[{t}] no per-PC stall samples: collect with --set full or "
-                      f"--section SourceCounters", file=sys.stderr)
+                if stall_status == "not_collected":
+                    message = "no per-PC stall metrics in report; collect with --set full or --section SourceCounters"
+                elif stall_status == "zero_stalls":
+                    message = "per-PC metrics are present and correlated, but all sampled stall counts are zero"
+                else:
+                    message = stall_detail or stall_status
+                print(f"[{t}] source stall analysis unavailable: {message}", file=sys.stderr)
                 continue
             per_line = aggregate_by_source_line(action, per_pc)
-            if set(per_line) == {("?", 0)}:
-                print(f"[{t}] no source lines: the kernel has no line info (built without "
-                      f"-lineinfo); see 02-harness-guide.md", file=sys.stderr)
+            coverage = source_line_coverage(action, per_pc)
+            if stall_status == "partial":
+                print(f"[{t}] some per-PC values could not be read; remaining stall totals are partial: "
+                      f"{stall_detail}", file=sys.stderr)
+            if coverage["status"] == "unavailable":
+                print(f"[{t}] stall samples exist, but source lines are unavailable; verify "
+                      f"that the exact profiled binary was built with -lineinfo", file=sys.stderr)
+            elif coverage["status"] == "partial":
+                print(f"[{t}] source-line attribution is partial: {coverage['mapped_pcs']}/"
+                      f"{coverage['sampled_pcs']} sampled PCs mapped", file=sys.stderr)
             kernel_lines = alignment = None
             if args.binary:
                 try:
@@ -264,7 +347,7 @@ def main():
                                if kernel_lines is not None else None)
             out = analysis_dir / f"stall_hotspots_{t}.txt"
             write_report(per_line, out, t, kernel_name(action, 'function'), args.top, kernel_lines, alignment,
-                         executed, kernel_executed)
+                         executed, kernel_executed, coverage)
             print(f"[{t}] -> {out} ({len(per_line)} distinct lines)")
 
 

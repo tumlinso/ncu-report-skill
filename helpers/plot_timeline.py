@@ -7,8 +7,9 @@ pipeline bubbles, and sawtooth patterns that are invisible in aggregate metrics.
 
 The series come from the PmSampling section (part of `--set full`), named
 `<UNIT>.<group>.<metric>` (e.g. `TPC.TriageCompute.sm__cycles_active...`);
-`--list` prints the series a report has and its number of timed warp samples. With ncu_report 2026.3+ each series is
-aligned to the workload's timestamps.
+`--list` prints the series a report has and its timed warp-sample availability.
+When the reader exposes timeline alignment, series use aligned workload
+timestamps; older readers fall back to report-provided sample times.
 
 ncu collects the series over replays of the kernel, and each replay has its own
 time base. Series of one replay share a time axis: they are plotted together,
@@ -16,11 +17,9 @@ over the window where any of them is non-zero, so their shapes line up. Series
 of different replays do not line up sample for sample — compare their shapes,
 not positions.
 
-The stall reasons over time come from the timed warp samples the same
-section holds: the share of samples in each time
-bucket per reason, over the span the kernel had warps resident. (Reports of ncu
-before 2026.3 may also have `pmsampling:smsp__warps_issue_stalled_*` series, from
-the PmSampling_WarpStates section; they are plotted as PM series.)
+The stall reasons over time come from the optional timed warp samples the same
+section holds. Some architectures and report API versions do not provide these
+samples. PM sampling timelines are unsupported on Volta/SM70.
 
 Produces `<run-dir>/analysis/pm_timeline_<tag>.txt` per profiled kernel.
 
@@ -38,8 +37,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from ncu_utils import (  # noqa: E402
-    action_tags, kernel_name, pm_series, pm_series_names, select_actions,
-    warp_state_timeline,
+    action_architecture, action_tags, kernel_name, pm_series_names, pm_series_result,
+    select_actions, timed_warp_sample_info, warp_state_timeline_result,
 )
 
 
@@ -98,11 +97,26 @@ def _active_samples(group, n):
 def plot_replays(action, names, rows, cols):
     """Plot `names`, grouped by the replay (time base) each series was sampled in."""
     replays = {}
+    alignment_statuses = set()
+    alignment_errors = []
     for name in names:
-        ts, vals = pm_series(action, name)
+        series, status, error = pm_series_result(action, name)
+        alignment_statuses.add(status)
+        if error:
+            alignment_errors.append(error)
+        if series is None:
+            continue
+        ts, vals = series
         key = (ts[0], ts[-1], len(ts)) if ts else name
         replays.setdefault(key, []).append((name, ts, vals))
     out = []
+    if "alignment_error" in alignment_statuses:
+        out.append("[note] timeline alignment failed; raw PM sample series are shown where available: "
+                   + alignment_errors[0])
+    elif alignment_statuses and alignment_statuses <= {"raw"}:
+        out.append("[note] using report-provided sample times; this API exposes no aligned timeline view")
+    elif "raw" in alignment_statuses:
+        out.append("[note] one or more PM series use report-provided sample times without alignment")
     for k, group in enumerate(replays.values()):
         ts = group[0][1]
         n = len(group[0][2])
@@ -117,10 +131,14 @@ def plot_replays(action, names, rows, cols):
     return out
 
 
-def plot_warp_states(action, rows, cols, top):
+def plot_warp_states(action, rows, cols, top, timeline_result=None):
     """The `top` most sampled stall reasons over the kernel's run, from its timed warp samples."""
-    result = warp_state_timeline(action, cols)
+    if timeline_result is None:
+        timeline_result = warp_state_timeline_result(action, cols)
+    result, status, error = timeline_result
     if result is None:
+        if status == "error":
+            return [f"\n[note] timed warp-sample processing failed: {error}"]
         return []
     span, shares = result
     order = sorted(shares, key=lambda r: -sum(shares[r]))[:top]
@@ -166,19 +184,45 @@ def main():
             continue
         for action, t in zip(acts, action_tags(tag, acts)):
             names = pm_series_names(action)
+            arch = action_architecture(action)
+            warp_status, warp_count, warp_error = timed_warp_sample_info(action)
             if args.list:
-                print(f"[{t}] {len(names)} series, {len(action.timed_warp_samples())} timed warp samples")
+                print(f"[{t}] {len(names)} PM series, timed warp samples: "
+                      f"{warp_count if warp_count is not None else warp_status}; architecture: {arch}")
                 print("\n".join(f"  {n}" for n in names))
+                if arch == "sm_70":
+                    print("  PM sampling timelines are unsupported on Volta/SM70.")
                 continue
-            warp_states = plot_warp_states(action, args.rows, args.cols, args.stall_reasons) \
-                if args.stall_reasons else []
+            if arch == "sm_70":
+                print(f"[{t}] PM sampling timelines are unsupported on Volta/SM70; "
+                      "use aggregate metrics and source counters instead.", file=sys.stderr)
+                continue
+            warp_timeline = warp_state_timeline_result(action, args.cols) \
+                if args.stall_reasons else (None, "disabled", None)
+            warp_states = plot_warp_states(
+                action, args.rows, args.cols, args.stall_reasons, warp_timeline
+            ) if args.stall_reasons else []
             if not names and not warp_states:
-                print(f"[{t}] no PM sampling series or timed warp samples: collect with --set full",
+                if warp_timeline[1] == "error":
+                    reason = f"timed warp-sample processing failed: {warp_timeline[2]}"
+                elif warp_status == "unsupported":
+                    reason = "the reader API has no timed warp-sample method and the report has no PM series"
+                elif warp_status == "error":
+                    reason = f"timed warp-sample processing failed: {warp_error}"
+                elif warp_status == "no_data":
+                    reason = "the report has no timed warp samples or PM series"
+                else:
+                    reason = "no PM sampling measurements were found"
+                print(f"[{t}] timeline unavailable: {reason}; aggregate analysis remains available",
                       file=sys.stderr)
                 continue
             dur = action["gpu__time_duration.sum"].value() if "gpu__time_duration.sum" in action.metric_names() else None
             dur = f" ({dur / 1e3:.1f} us, gpu__time_duration)" if dur else ""
-            out_lines = [f"{'=' * 60}\n{t}: {rep.name}\n{kernel_name(action, 'function')}{dur}\n{'=' * 60}"]
+            out_lines = [f"{'=' * 60}\n{t}: {rep.name}\n{kernel_name(action, 'function')}{dur}\n"
+                         f"Architecture: {arch}\nTimed warp samples: {warp_status}"
+                         f"{f' ({warp_count})' if warp_count is not None else ''}\n"
+                         f"Warp-state timeline: {warp_timeline[1]}"
+                         f"{f' ({warp_timeline[2]})' if warp_timeline[2] else ''}\n{'=' * 60}"]
             chosen = [n for p in patterns for n in names if p.search(n)]
             out_lines.extend(plot_replays(action, list(dict.fromkeys(chosen)), args.rows, args.cols))
             out_lines.extend(warp_states)

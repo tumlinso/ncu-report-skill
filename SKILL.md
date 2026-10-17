@@ -1,13 +1,13 @@
 ---
 name: ncu-report-skill
-description: Use before deciding how to optimize a CUDA kernel (hand-written CUDA, Triton, CUTLASS/CuTe), when a kernel is slower than expected, and whenever you are about to run Nsight Compute (ncu) or read its output — instead of guessing at the bottleneck, writing your own profiling script, or reading ncu's console tables by eye. One ncu collection, then helpers that extract key metrics, NCU's rule results, per-line stalls (inlined CUTLASS/CuTe/Triton code included) and PM timelines, and a playbook from signals to fixes. Also when a user asks to profile a kernel, read an ncu report or write an optimization plan ("profile 一下", "为什么慢", "ncu 报告"). Written for ncu 2026.3 on Blackwell (B200 / B300) and other NVIDIA GPUs.
+description: Use before deciding how to optimize a CUDA kernel (hand-written CUDA, Triton, CUTLASS/CuTe), when a kernel is slower than expected, and whenever you are about to run Nsight Compute (ncu) or read its output — instead of guessing at the bottleneck, writing your own profiling script, or reading ncu's console tables by eye. One ncu collection, then helpers that extract available metrics, rule results, source stalls and supported timelines, followed by evidence-based diagnoses. Also when a user asks to profile a kernel, read an ncu report or write an optimization plan ("profile 一下", "为什么慢", "ncu 报告"). Blackwell guidance targets ncu 2026.3; Volta is supported with ncu 2025.2.
 ---
 
 # Skill: CUDA Kernel Profiling (Nsight Compute)
 
 **When to use:** before choosing what to optimize in a GPU kernel (CUDA C++, Triton, CUTLASS/CuTe), when a kernel is slower than its budget or baseline, after a change whose effect you do not understand, and every time you are about to run `ncu` or read a report — so the bottleneck comes from measurements, not guesses. Also when someone asks to profile a kernel, find its bottlenecks, read an ncu report or write an optimization plan ("profile X", "为什么这个 kernel 慢", "ncu report 说...", "下一步怎么优化", "帮我看一下这份 ncu 报告").
 
-**Written for:** Nsight Compute 2026.3.1, the newest release (it also reads reports of older versions), on Blackwell — B200 (sm_100) and B300 (sm_103), 148 SMs each. A CUDA toolkit bundles the ncu of its release (CUDA 13.2: 2026.1.1); newer ones are separate installs (NVIDIA's CUDA package repositories carry `nsight-compute-<version>`, and the toolkit's `ncu` launcher runs the newest installed). Most advice is generic; GPU- or version-specific notes say so. ncu's flags, sets and metric names change between releases: `ncu --version`, `ncu --help`, `ncu --list-sets` and `ncu --list-sections` are the authority when something here does not match what you have.
+**Profiler support:** Blackwell examples target Nsight Compute 2026.3.1. Volta (GV100 / Tesla V100 / `sm_70`) requires Nsight Compute 2025.2.x; later releases removed GV100 support. Select the profiler executable explicitly with `NCU` (default `ncu`) and check `"$NCU" --version`, `"$NCU" --help`, `"$NCU" --list-sets`, and `"$NCU" --list-sections`. Flags, sections, metric names, report APIs, and hardware features vary by release. Architecture-specific guidance is identified below; use [`reference/10-volta.md`](reference/10-volta.md) for SM70 diagnosis. The Blackwell companion remains scoped to Blackwell.
 
 ---
 
@@ -27,9 +27,14 @@ Most under-performing CUDA kernels are under-performing for exactly one reason t
 
 2. **Get a profile target.** If the kernel already carries line info (many prebuilt libraries do; [`reference/02-harness-guide.md`](reference/02-harness-guide.md) shows how to check), profile the real code: a few-line driver (Python or C++) that calls it once on a representative input is enough. Build a standalone harness with `-lineinfo` when the build has no line info or the kernel is buried in a slow program; the template is [`helpers/harness_template.cu`](helpers/harness_template.cu). Keep it in `$PROFILE_RUN_DIR/harness/`.
 
-3. **Collect one report** with `--set full`: it holds the per-PC stall samples (SourceCounters) and the PM-sampling timelines and timed warp samples (PmSampling); `--import-source yes` embeds the source so the report reads anywhere. Give `-o` the `.ncu-rep` extension (without one, ncu 2026.3 writes `.ncu-repz`; the helpers read both):
+3. **Collect one report** with `--set full`: it requests standard sections, including SourceCounters and PM sampling where the profiler and GPU support them. Volta does not provide the PM timelines used by the Blackwell workflow; this does not prevent other analyses. `--import-source yes` embeds source when available. Give `-o` the `.ncu-rep` extension (without one, newer releases may choose `.ncu-repz`; the helpers read both):
    ```bash
-   ncu --set full --import-source yes --clock-control boost \
+   export NCU="${NCU:-ncu}"  # shared by collection and Python binding discovery
+   # Optional explicit clock policy: base on 2025.2, or boost on newer
+   # releases when listed by --help. If unset, record the profiler default.
+   CLOCK_ARGS=()
+   if [[ -n "${CLOCK_CONTROL:-}" ]]; then CLOCK_ARGS=(--clock-control "$CLOCK_CONTROL"); fi
+   "$NCU" --set full --import-source yes "${CLOCK_ARGS[@]}" \
        -k "regex:KERNEL" -c 1 -o "$PROFILE_RUN_DIR/reports/full_<tag>.ncu-rep" <command> [args]
    ```
    See [`reference/03-collection.md`](reference/03-collection.md) for picking the launch, skipping warm-up and faster targeted runs.
@@ -48,7 +53,7 @@ Most under-performing CUDA kernels are under-performing for exactly one reason t
 
 Only `ncu` (and the program it launches) needs a GPU. Building the harness for an explicit architecture, `ncu --import`, and every Python helper only read and write files, so they can run on a machine or in a container without one. No helper picks a GPU or locks a clock: run `ncu` on the GPU your environment gives you, the way it runs any GPU command. If GPU commands run in another container or on another machine, keep the run directory where both see it (inside the project, say) and pass paths that exist on both sides.
 
-ncu locks the GPU clock for every profiled kernel by default, which keeps reports comparable: at boost in ncu 2026.1–2026.3 (`--clock-control boost`; older versions default to `base`, which on a B300 runs kernels ~1.7x slower). `ncu --help` shows the default. To profile at another fixed clock, lock it outside ncu (e.g. `sudo nvidia-smi -lgc MHZ,MHZ` before, `sudo nvidia-smi -rgc` after) and pass `--clock-control none`, or ncu replaces your lock with its own. See [`reference/03-collection.md`](reference/03-collection.md#gpu-clocks).
+Select clock control from `"$NCU" --help`: Nsight Compute 2025.2 supports `base`, `none`, and `reset`; modern releases may offer `boost`. To preserve the profiler's default behavior, leave `CLOCK_CONTROL` unset; when you need a fixed, comparable policy, set it to a value supported by that version (for example, `base` for 2025.2 or `boost` on a modern release that lists it). Record the policy and measured clock. See [`reference/03-collection.md`](reference/03-collection.md#gpu-clocks).
 
 ---
 
@@ -68,6 +73,7 @@ ncu locks the GPU clock for every profiled kernel by default, which keeps report
 | [`reference/07-report-template.md`](reference/07-report-template.md) | How to structure the final report |
 | [`reference/08-metric-names.md`](reference/08-metric-names.md) | Metric names on Blackwell with ncu 2026.3, and the ones that differ from older docs |
 | [`reference/09-common-issues.md`](reference/09-common-issues.md) | Permissions, PM sampling, inlined code, TVM-FFI / PyTorch gotchas |
+| [`reference/10-volta.md`](reference/10-volta.md) | Portable SM70 collection limits, supported evidence, and Volta-specific diagnosis |
 
 ### Helpers (reusable code)
 
@@ -85,11 +91,11 @@ ncu locks the GPU clock for every profiled kernel by default, which keeps report
 
 ## Critical lessons (don't skip)
 
-1. **Metric names differ between GPUs and ncu releases.** [`reference/08-metric-names.md`](reference/08-metric-names.md) lists what `--set full` collects on Blackwell with ncu 2026.3. A name missing from a report may still exist: request it with `--metrics`. Enumerate with `action.metric_names()` or `ncu --query-metrics`.
+1. **Metric names differ between GPUs and ncu releases.** [`reference/08-metric-names.md`](reference/08-metric-names.md) lists Blackwell names. For Volta, use [`reference/10-volta.md`](reference/10-volta.md), inspect the selected profiler's `--query-metrics`, and enumerate collected values with `action.metric_names()`. A missing metric is unavailable evidence, not a zero measurement.
 
 2. **Always compile with `-lineinfo`** (or profile code that has it). Without it, ncu's source view is blank and you cannot do per-line stall analysis. ncu attributes each PC to its innermost inlined frame — a library header for CUTLASS/CuTe code — so pass the profiled binary to `extract_stall_hotspots.py --binary` to rank the kernel's own lines.
 
-3. **PM sampling is the only way to see tail effects.** Static metrics average over the whole kernel; only the time-series (`helpers/plot_timeline.py`) shows the shape of utilization over time.
+3. **PM sampling timelines depend on hardware and profiler support.** On supported GPUs, `helpers/plot_timeline.py` can show time-varying utilization; Volta does not support these PM-sampling timelines. Missing timelines do not block occupancy, instruction, memory, rule, or source-counter analysis. Do not claim a measured tail shape without a supported timeline or other direct evidence.
 
 4. **Load-imbalance on variable-length inputs is often the #1 bottleneck.** If the user's workload has sequences of varying length, per-SM active-cycle variance will often dwarf every other effect. Always check the input distribution.
 

@@ -8,7 +8,7 @@
 // Compile with:
 //     nvcc -O2 -std=c++17 -lineinfo -arch=sm_100a \
 //          my_kernel_harness.cu -o my_kernel_harness
-//     (sm_100a: B200; sm_103a: B300 — the GPU's compute capability, see
+//     (examples: sm_70: V100; sm_100a: B200; sm_103a: B300 — use the GPU's compute capability, see
 //      ../reference/02-harness-guide.md)
 //
 // Usage modes this template supports:

@@ -79,7 +79,7 @@ Inside each run subdirectory, use this structure:
     ├── compare_<a>_vs_<b>.txt      ← side-by-side
     ├── details_<tag>.txt           ← ncu --page details dump
     ├── stall_hotspots_<tag>.txt    ← per-line stall aggregation
-    ├── pm_timeline_<tag>.txt       ← ASCII time-series
+    ├── pm_timeline_<tag>.txt       ← optional ASCII time-series when supported/collected
     └── raw_<tag>.csv               ← optional: ncu CSV export
 ```
 

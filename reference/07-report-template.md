@@ -12,10 +12,11 @@ Save as `$PROFILE_RUN_DIR/REPORT.md`.
 # `<kernel_name>` Profiling Report
 
 **Kernel:** `<exact kernel name or template instantiation>`
-**Target GPU:** NVIDIA B300 (148 SM, CC 10.3)   (whatever is actually being profiled: `nvidia-smi --query-gpu=name,compute_cap --format=csv`)
-**Nsight Compute:** 2026.x.x (`ncu --version`)
-**Clock:** `--clock-control boost`, SM at X.XX GHz (`sm__cycles_elapsed.avg.per_second`)
-**Compile flags:** `nvcc -O2 -std=c++17 -lineinfo -arch=sm_103a`   (or: the prebuilt library profiled, and that it has line info)
+**Target GPU:** `<actual GPU name, SM count, compute capability>` (`nvidia-smi --query-gpu=name,compute_cap --format=csv`)
+**Profiler used to collect:** `<version from report metadata or collection provenance; unknown if unavailable>`
+**Reader API:** `ncu_report <exposed version or unknown>`; module location: `<path or unknown>`
+**Clock:** `<selected supported policy or unknown>`, SM at `<measured value or unavailable>`
+**Compile flags:** `<actual flags and target>` (or the prebuilt library profiled, and whether it has line information)
 **Profile date:** YYYY-MM-DD
 **Run directory:** `<profile_root>/<run_name>/`
 
@@ -29,14 +30,21 @@ Save as `$PROFILE_RUN_DIR/REPORT.md`.
 - Workloads: which real tensors / shapes were used. Cite the workload UUID or shape tuple.
 - Dispatch paths covered: list each `(SF / template params, grid, block)` combination profiled.
 - Metric-name caveats: any metric names that differ from stock NCU docs (see `08-metric-names.md`).
+- Evidence availability: list measurements present and analyses unavailable on this GPU, report, or API. The current `$NCU --version` does not identify which profiler produced an older report.
 
 Minimal runnable command listing:
 
-    # Compile
-    nvcc -O2 -std=c++17 -lineinfo -arch=sm_103a harness.cu -o "$PROFILE_RUN_DIR/harness/harness"
+    # Select the profiler and a clock policy supported by its --help output.
+    export NCU="${NCU:-ncu}"
+    # Optional: CLOCK_CONTROL=base for 2025.2, or boost on a newer profiler if supported.
+    CLOCK_ARGS=()
+    if [[ -n "${CLOCK_CONTROL:-}" ]]; then CLOCK_ARGS=(--clock-control "$CLOCK_CONTROL"); fi
 
-    # Profile (full: SOL, source counters, PM sampling + warp-state timelines)
-    ncu --set full --import-source yes \
+    # Set TARGET_ARCH to the actual target (for example, sm_70 for Volta).
+    nvcc -O2 -std=c++17 -lineinfo -arch="$TARGET_ARCH" harness.cu -o "$PROFILE_RUN_DIR/harness/harness"
+
+    # Request available standard sections; PM timelines depend on GPU support.
+    "$NCU" --set full --import-source yes "${CLOCK_ARGS[@]}" \
         -k "regex:<kernel_regex>" -c 1 \
         -o "$PROFILE_RUN_DIR/reports/full_<tag>.ncu-rep" \
         "$PROFILE_RUN_DIR/harness/harness" [args]
@@ -63,10 +71,14 @@ Minimal runnable command listing:
 | DRAM throughput (% peak, reads + writes) | X% | Y% | `gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed` |
 | L1 hit rate | X% | Y% | `l1tex__t_sector_hit_rate.pct` |
 | L2 hit rate | X% | Y% | `lts__t_sector_hit_rate.pct` |
-| Tensor Core usage | X% | Y% | `sm__pipe_tensor_cycles_active.*` |
+| Tensor Core usage | X or unavailable | Y or unavailable | cite a collected, target-supported metric |
 | Reg / thread | X | Y | `launch__registers_per_thread` |
-| Theoretical / Achieved occupancy | X% / Y% | ... | |
-| Waves / SM | X | Y | `launch__waves_per_multiprocessor` |
+| Theoretical / Achieved occupancy | X% / Y% or unavailable | ... | cite reported fields |
+| Waves / SM | X or unavailable | Y or unavailable | cite reported field |
+
+These rows are candidate fields. Use only metrics present in each report and
+supported by its architecture; leave missing values unavailable rather than
+recording zero.
 
 **One-line read:** <"The kernel runs at X% of peak SM throughput — it's latency-bound on Y, not DRAM-BW-bound."> — this is the punchline.
 
@@ -74,22 +86,22 @@ Minimal runnable command listing:
 
 ## 2. Per-dimension analysis
 
-> Walk through the six analysis dimensions, cite metrics, state findings.
+> Walk through the six analysis dimensions, cite metrics, and state findings. Distinguish a measured bottleneck, a hypothesis needing evidence, and an unavailable analysis.
 
 ### 2.1 SM occupancy & launch geometry
-<grid size, block size, waves/SM, occupancy, register/shared-mem limits, wave math>
+<grid size, block size, waves/SM, occupancy, register/shared-mem limits where reported; otherwise mark unavailable>
 
 ### 2.2 Thread-block balance (tail effect)
-<per-SM active cycles, PM timeline shape, input distribution imbalance ratios>
+<available per-SM active-cycle evidence, supported PM timeline shape if present, input distribution; mark unsupported or uncollected evidence unavailable>
 
 ### 2.3 Instruction-level stall analysis
 <stall breakdown %, top source-line hotspots (cite file:line + samples + stall type)>
 
 ### 2.4 Tensor Core utilization
-<value or "0%, n/a">
+<measured value or unavailable; a missing counter is not 0%>
 
 ### 2.5 SM utilization timeline
-<shape: flat-high / flat-low / tail / sawtooth — reference the ASCII plot in analysis/>
+<supported timeline shape with plot reference, or state unavailable for hardware/profiler/report>
 
 ### 2.6 Memory access pattern
 <sectors/request, L1/L2 hits, DRAM throughput, store efficiency, register spill>

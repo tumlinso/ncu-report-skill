@@ -7,9 +7,9 @@
 > For bug reports, feature requests, and discussions, please use the main KDA repository:
 > https://github.com/mit-han-lab/kernel-design-agents
 
-A Claude Code skill for profiling CUDA kernels with Nsight Compute on NVIDIA Blackwell (B200 / B300, sm_100 / sm_103). Covers the full workflow: get a profile target (the real code, or a standalone harness), run `ncu`, parse reports with the Python API, walk through six analysis dimensions, match patterns to a diagnosis playbook, and write an evidence-backed optimization report.
+A Claude Code skill for profiling CUDA kernels with Nsight Compute across NVIDIA GPU generations. Blackwell (B200 / B300, sm_100 / sm_103) guidance targets Nsight Compute 2026.3; Volta (GV100 / Tesla V100, sm_70) collection requires Nsight Compute 2025.2.x. It covers the full workflow: get a profile target (the real code, or a standalone harness), select and run `ncu`, parse reports with the Python API, interpret available measurements, and write an evidence-backed optimization report.
 
-Written against Nsight Compute 2026.3.1, the newest release (CUDA 13.2 bundles 2026.1.1; the skill's commands and helpers handle both): its sets and sections, report format, rule-result API, PM-sampling series and timelines, and default clock control.
+The shared workflow is architecture-aware. Metric names, report API features, sections, PM-sampling support, and clock policies depend on the GPU and profiler release. Volta's dedicated reference explains its evidence limits and appropriate diagnosis; the Blackwell programming companion remains Blackwell-specific.
 
 The skill is self-contained: reference docs, reusable helper scripts (harness template, safetensors loader, report-analysis Python), and a companion Blackwell programming reference all ship in this repo.
 
@@ -39,7 +39,8 @@ The skill is self-contained: reference docs, reusable helper scripts (harness te
 │   ├── 06-diagnosis-playbook.md      ← pattern → cause → fix
 │   ├── 07-report-template.md         ← final report structure
 │   ├── 08-metric-names.md            ← Blackwell metric names (ncu 2026.3)
-│   └── 09-common-issues.md           ← permissions, PM sampling, JIT toolchains, etc.
+│   ├── 09-common-issues.md           ← permissions, PM sampling, JIT toolchains, etc.
+│   └── 10-volta.md                   ← SM70 collection limits and diagnostic guidance
 └── blackwell-cuda-programming.md     ← companion reference: Blackwell programming principles
 ```
 
@@ -143,12 +144,12 @@ The C++ harness template + safetensors loader live under `helpers/`; copy them i
 
 ## Requirements
 
-- CUDA Toolkit with `nvcc`, `cuobjdump`, `nvdisasm` (tested with 13.2)
-- Nsight Compute CLI `ncu` (tested with 2026.3.1 and 2026.1.1)
+- CUDA Toolkit with `nvcc`, `cuobjdump`, `nvdisasm` (CUDA 12.x for SM70; modern examples use 13.2)
+- Nsight Compute CLI `ncu` (2025.2.x for Volta; 2026.3.1 for Blackwell guidance)
 - The `ncu_report` Python module (ships with Nsight Compute under `extras/python/`)
 - An NVIDIA GPU with permission to access performance counters (see `reference/09-common-issues.md` if `ncu` reports `ERR_NVGPUCTRPERM`)
 
-The skill is written for Blackwell (B200 / B300) metric names, but the workflow and helpers work on any CUDA GPU Nsight Compute supports. Metric names may differ on older GPUs (A100, H100) and other ncu releases — see `reference/08-metric-names.md` for guidance.
+The Blackwell metric reference is specific to Blackwell and Nsight Compute 2026.3. The shared workflow and helpers handle architecture-dependent measurements where supported. For V100 / SM70, use Nsight Compute 2025.2.x and `reference/10-volta.md`; for other GPUs and releases, inspect the selected profiler's metric and section lists rather than assuming Blackwell names apply.
 
 ---
 

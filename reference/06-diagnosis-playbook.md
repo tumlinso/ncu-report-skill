@@ -2,6 +2,11 @@
 
 For each observed NCU signal, what does it typically mean, and what's the first fix to try? This synthesizes the Blackwell programming principles (the companion `blackwell-cuda-programming.md` at the repo root) with the profiling signals.
 
+These patterns use architecture-dependent counters. Blackwell names and
+instruction advice below are scoped to that architecture; use
+[`10-volta.md`](10-volta.md) for SM70 counters and feature limits. Treat a
+missing metric as unavailable evidence, not as zero activity.
+
 Read this after you've gathered the metrics (via [`05-analysis-dimensions.md`](05-analysis-dimensions.md)) — here you translate metrics into diagnoses and fix directions.
 
 ---
@@ -51,7 +56,7 @@ Most kernels will match 2-4 patterns simultaneously. **Rank them by magnitude** 
 **Signals:**
 - Multi-workload: `max_seq_len / avg_seq_len > 3` in input distribution.
 - Per-SM active cycles span 5-100× between slowest and fastest SM (from `--page details` distribution) — or much less when the longest CTAs start late: then the SM-activity timeline's falling edge is the signal.
-- PM timeline shape: long gradual tail at the end (visible via `plot_timeline.py`).
+- PM timeline shape: long gradual tail at the end where PM timelines are supported and collected (visible via `plot_timeline.py`). On Volta, mark this evidence unavailable and use supported static balance counters instead.
 - `launch__waves_per_multiprocessor > 1.05` with partial last wave.
 - NCU rule: `"partial wave may account for up to X% of the total runtime"`.
 
@@ -135,7 +140,7 @@ If `K < 8`: consider batching multiple iterations' results into a vectorized wri
 **First-line fix:** increase in-flight memory requests:
 - **Unroll the load loop** so 4-8 loads are issued before any value is used. Compiler + hardware reorders.
 - **Add more independent warps** — raise occupancy (Pattern J).
-- **`cp.async` (Ampere+) / TMA (Hopper+) / tcgen05.cp (Blackwell)** for bulk async loads that don't block issue.
+- **Architecture-specific asynchronous copies** when available: `cp.async` (Ampere+) / TMA (Hopper+) / `tcgen05.cp` (Blackwell). These mechanisms are unavailable on Volta; do not recommend them for SM70.
 
 **Deeper fixes:**
 - Software pipelining: while tile N is being computed, pre-load tile N+1 into shared memory.
@@ -152,15 +157,15 @@ If `K < 8`: consider batching multiple iterations' results into a vectorized wri
 
 **Signals:**
 - `sm__inst_executed_pipe_fma.avg.pct_of_peak_sustained_active > 50%`.
-- `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed = 0%`.
+- `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed = 0%`, only when the metric exists and was collected.
 - Workload is matmul-ish (GEMM, attention, conv).
 
 **Why:** kernel uses scalar FMA via the ALU pipe instead of tensor cores. On B200, tensor cores can do 16× the FMA throughput of scalar pipes for BF16→FP32.
 
-**First-line fix:** use `WMMA` (Ampere+) / `wgmma` (Hopper) / `tcgen05.mma` (Blackwell). If hand-rolling is too much, use CUTLASS 4.x or cuBLAS, which are already tuned for the target arch.
+**First-line fix:** choose a matrix path supported by the target. Volta supports WMMA and FP16 input with FP32 accumulation; Ampere adds other modes; Hopper supports WGMMA; Blackwell supports `tcgen05.mma`. BF16 Tensor Core arithmetic, TF32, `cp.async`, TMA, WGMMA, and `tcgen05` are not Volta options. If hand-rolling is too much, compare the target-appropriate CUTLASS or cuBLAS path.
 
 **Deeper fixes:**
-- Restructure data layout to meet MMA tile-shape constraints (e.g., `m16n8k16` for BF16).
+- Restructure data layout to meet the target's MMA tile-shape constraints and datatype support.
 - Use shared memory + TMA (Hopper) / TMEM (Blackwell) staging.
 
 **Exceptions:**
@@ -168,6 +173,10 @@ If `K < 8`: consider batching multiple iterations' results into a vectorized wri
 - Small matrices (M, N, K < 32) — tensor-core tiles are too coarse.
 
 **Cross-ref:** Blackwell principle 10; the Blackwell doc's section on tcgen05 has PTX examples.
+
+For Volta, establish this pattern only when collected Tensor Core counters and
+the operation's eligibility support it; a missing metric does not mean 0%.
+See [`10-volta.md`](10-volta.md).
 
 ---
 
@@ -299,7 +308,7 @@ If `K < 8`: consider batching multiple iterations' results into a vectorized wri
 **First-line fix:** double-buffer. Use two shared-memory tiles; while computing on tile A, load tile B. `__syncthreads` between phases.
 
 **Deeper fixes:**
-- Multi-stage pipeline (3-4 stages on Blackwell — see Blackwell principle 15). Use `cp.async` / TMA for async loads.
+- Multi-stage pipeline (3-4 stages on Blackwell — see Blackwell principle 15). Use only copy mechanisms available on the target; Volta does not have `cp.async` or TMA.
 
 **Cross-ref:** Blackwell principle 15.
 

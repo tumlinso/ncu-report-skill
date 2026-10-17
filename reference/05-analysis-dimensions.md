@@ -69,6 +69,7 @@ There is no single "imbalance" metric — use these signals together:
 sm__cycles_active.{avg,max,min,sum}       # via action.source_info or the details page
 
 # PM sampling (time series) — the shape matters, not just the mean
+# Available only on supported GPU/profiler combinations; unavailable on Volta.
 TPC.TriageCompute.sm__cycles_active.avg.per_cycle_elapsed
 TPC.TriageCompute.sm__inst_executed_realtime.avg.per_cycle_active
 # and the stall reasons over time: the timed warp samples (plot_timeline.py)
@@ -77,7 +78,7 @@ TPC.TriageCompute.sm__inst_executed_realtime.avg.per_cycle_active
 **Reading:**
 
 - NCU's `details` page already says it: `"One or more SMs have a much lower number of active cycles than the average. Maximum instance value is X% above, while the minimum is Y% below."` X=51% / Y=95% (seen in practice) means severe imbalance.
-- Render the PM-sampling time series (use `plot_timeline.py`). Possible shapes:
+- If PM timelines are available, render the time series with `plot_timeline.py`. Volta has no such timeline; use static distribution counters where present and mark tail-shape analysis unavailable. Possible supported-GPU shapes:
   - **Flat high → clean drop**: ideal. Well-balanced, good SM fill.
   - **Flat high → gradual tail**: tail effect. The tail's length is how much time a few slow blocks waste. Usually caused by variable-length inputs (e.g. seq_len varies per batch element).
   - **Flat low**: grid is too small (Dimension 1).
@@ -91,7 +92,7 @@ TPC.TriageCompute.sm__inst_executed_realtime.avg.per_cycle_active
 
 **Fix direction:** chunk the variable-length work (e.g., time-chunking for sequence-style workloads), or oversubscribe with work-stealing.
 
-**Helper:** `plot_timeline.py` produces ASCII timeline plots. If you see a gradual slope on the right side, that's your tail effect.
+**Helper:** `plot_timeline.py` produces ASCII timeline plots where supported. A gradual right-side slope is evidence of a tail only when that timeline was actually collected. See [`10-volta.md`](10-volta.md) for SM70 interpretation.
 
 Additionally, **always inspect the input distribution**. If per-CTA work is driven by an array like `per_element_lengths`:
 ```python
@@ -175,7 +176,7 @@ smsp__pcsamp_warps_issue_stalled_selected                  # productive cycles
 
 **What:** is the kernel using tensor cores at all? If yes, how well?
 
-**Metrics:**
+**Metrics (the names below are examples from the Blackwell 2026.3 metric set; query the selected profiler and use only counters present in the report):**
 ```
 sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed      # overall TC activity
 sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active       # per active SM cycle
@@ -190,19 +191,24 @@ smsp__sass_inst_executed_op_utcmma.sum                                # tcgen05.
 
 **Reading:**
 
+For Volta, do not apply Blackwell metric names or utilization thresholds. See [`10-volta.md`](10-volta.md) for SM70 Tensor Core and FP16/FP32 interpretation. A missing Tensor Core metric is unavailable evidence, not zero use.
+
 - **`sm__pipe_tensor_cycles_active = 0%`**: no tensor core usage at all. For matmul-ish kernels (attention, GEMM, conv), this is almost always a missed optimization.
 - **`... = X%` but X << 50%**: tensor cores are being used but underutilized. Usually means data isn't arriving fast enough (Dimension 6) or tile sizes are wrong.
 - **`... > 50%`** on B200: kernel is doing well on the Tensor-Core front. Focus elsewhere.
 
 **Blackwell-specific note:** B200 uses 5th-gen tensor cores with `tcgen05.mma` + TMEM accumulators. Hand-rolled kernels need `tcgen05.alloc`, `tcgen05.mma`, `tcgen05.ld`, `tcgen05.dealloc` PTX. Most projects should use CUTLASS 4.x / cuBLAS instead of hand-rolling. See `../blackwell-cuda-programming.md` at the repo root.
 
-**Fix direction:** if you see 0% and the workload is matrix-multiplication-shaped, redesign around MMA. This is usually a major refactor but gives 2-10× on compute-bound paths.
+**Fix direction:** if supported counters show no Tensor Core activity and the workload is eligible matrix multiplication, check architecture-specific MMA support and a tuned library path before redesigning. A missing metric is not a measured zero. See [`10-volta.md`](10-volta.md) for Volta capabilities; the following tcgen05 note applies only to Blackwell.
 
 ---
 
 ## Dimension 5 — SM utilization timeline
 
 **What:** how does SM utilization vary over the kernel's lifetime?
+
+This dimension requires PM-sampling support and collected samples. It is
+unavailable on Volta; do not infer a timeline shape from static averages.
 
 **Metrics (PM sampling, time-series):**
 ```
@@ -220,7 +226,7 @@ FBSP.TriageCompute.dram__throughput.avg.pct_of_peak_sustained_elapsed
 - **Periodic sawtooth (compute ↕ memory)**: no compute-memory overlap — missing pipeline/double-buffering.
 - **Slow ramp up, flat middle, clean drop**: kernel has warmup work (prologue), then steady state. Usually fine.
 
-**Helper:** `plot_timeline.py` — renders ASCII plots. Look at multiple series side-by-side (SM throughput + DRAM throughput + long_scoreboard stalls) to distinguish the shapes.
+**Helper:** `plot_timeline.py` — renders ASCII plots when the GPU and report support PM sampling. Look at multiple series side-by-side to distinguish shapes. On Volta, continue with static occupancy, memory, instruction and source-counter evidence instead.
 
 **Note:** the PM sampling interval was ~1 µs on a B300 (`plot_timeline.py` prints it per replay group). Very short kernels (< 20 µs) produce few samples — interpret with care. Series names: `08-metric-names.md`; `plot_timeline.py --list` shows a report's.
 
@@ -295,6 +301,6 @@ OPT   Est. Speedup: 10.8%
 
 After walking through all six, write a one-line diagnosis combining them. Structure: name the top 3–4 signals, each tied to a specific dimension. For example:
 
-> "The kernel runs at X% of peak SM throughput and Y% of peak DRAM (Dim 1, 6). Stall time is dominated by `<stall_reason>` (Z% of samples, Dim 3), concentrated on <N> source lines whose access pattern is <coalesced/uncoalesced/...> (Dim 6). The PM timeline shows <flat / tail / sawtooth> shape (Dim 2/5). Tensor cores <used / unused at W%> (Dim 4)."
+> "The kernel runs at X% of peak SM throughput and Y% of peak DRAM (Dim 1, 6). Stall time is dominated by `<stall_reason>` (Z% of samples, Dim 3), concentrated on <N> source lines whose access pattern is <...> (Dim 6). PM timeline shape: <measured shape or unavailable> (Dim 2/5). Tensor Core evidence: <measured value or unavailable> (Dim 4)."
 
 Fill in the X/Y/Z/W/N values and <classifications> from your own report. That sentence is the deliverable. Everything else in the report is evidence backing it.

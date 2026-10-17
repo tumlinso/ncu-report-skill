@@ -98,10 +98,9 @@ ncu maps most PCs to their **innermost** inlined frame. In template-heavy code n
 
 ## PM sampling returns nothing
 
-1. **You didn't request it.** `--set full` includes the PmSampling section. (`--section PmSampling_WarpStates`, for stall-reason series, exists only before ncu 2026.3; from 2026.3 the stall reasons over time come from the timed warp samples of PmSampling.) `plot_timeline.py --list` prints the series a report has and its number of timed warp samples.
-2. **vGPU / MIG environment.** PM sampling isn't supported under virtualization. Use metric-based (non-timeline) analysis only.
-3. **Kernel too short.** Kernels under ~20 µs produce few PM samples; what comes back is dominated by warmup noise.
-4. **You asked for a name the report does not have.** ncu 2026.1 and 2026.3 name the PmSampling series `<UNIT>.<group>.<metric>` (e.g. `TPC.TriageCompute.sm__cycles_active.avg.per_cycle_elapsed`); `pmsampling:sm__throughput.*` and `pmsampling:dram__throughput.*` from older docs do not exist. `plot_timeline.py --list` prints what the report has.
+First establish that the GPU, profiler, and report contain this analysis dimension. Volta does not support the PM timelines used by the Blackwell workflow; continue with available static occupancy, instruction, memory, and source-counter analyses.
+
+On supported GPUs, inspect `plot_timeline.py --list` and the selected profiler's sections. `--set full` requests standard sections, but it does not guarantee every capability is present. Nsight Compute APIs also vary: `timed_warp_samples()` is optional and absent in older report APIs. Virtualized environments or very short kernels can limit samples. A missing series or method is unavailable evidence, not a measured zero.
 
 ---
 
@@ -122,9 +121,9 @@ ncu maps most PCs to their **innermost** inlined frame. In template-heavy code n
 
 ## Metric returns `None`
 
-1. **Wrong metric name.** See `08-metric-names.md`. Many stock docs use names `--set full` does not collect on Blackwell.
+1. **Wrong metric name.** See `08-metric-names.md` for Blackwell and `10-volta.md` for GV100 examples. Query the selected profiler and inspect metrics actually present in the report.
 2. **Metric not in the collected sections.** Add the relevant `--section` or `--set`, or ask for it with `--metrics` (some metrics are in no section).
-3. **Value is legitimately missing.** Some metrics (like tensor pipe counters) return 0 rather than None when the feature wasn't used; but others return None for hardware not present.
+3. **Value is legitimately missing.** Missing can mean the metric was not collected, the API does not expose it, or the hardware does not provide it. A returned numeric zero is a measured zero; `None` is not.
 
 Always wrap metric reads in a helper that returns a default:
 ```python
@@ -139,13 +138,13 @@ def safe(action, name, default=None):
 
 ## `ncu_report` import fails
 
-`ncu_report.py` ships in `<Nsight Compute install>/extras/python`. The helpers find the install from the `ncu` on PATH, as the CUDA toolkit's `ncu` launcher does (`/opt/nvidia/nsight-compute/<version>` for .deb/.rpm installs, `<toolkit>/nsight-compute-<version>` for .run installs; the newest wins):
+`ncu_report.py` ships in `<Nsight Compute install>/extras/python`. The helpers preserve standard Python import resolution, including `PYTHONPATH`, then discover bindings associated with the selected `NCU` executable. Set `NCU_REPORT_PYTHON_PATH` to an `extras/python` directory if automatic discovery cannot find the intended module:
 
 ```bash
 python3 <skill>/helpers/ncu_utils.py      # prints where it found ncu_report; raises ImportError if it found none
 ```
 
-If `ncu` is not on PATH or the install is elsewhere, put its `extras/python` on `PYTHONPATH` yourself. If there's still an `ImportError`, check that the module is compatible with your Python version.
+If import still fails, check the selected module location and whether its native extension is compatible with your Python version and platform.
 
 ---
 
@@ -185,7 +184,7 @@ ncu handles CUDA Graph launches fine — each captured kernel shows up as a sepa
 
 ### Results jitter between runs
 
-1. **Check the clock.** ncu locks the clock by default (`boost` in ncu 2026.1–2026.3, `base` before); a run with
+1. **Check the clock.** Clock policies vary by NCU release: 2025.2 supports `base`, `none`, and `reset`; newer releases may also support `boost`. Check the selected profiler's `--help`; an unset option uses that version's default. A run with
    `--clock-control none` and no outer lock profiles at whatever clock the GPU picks. Compare
    `sm__cycles_elapsed.avg.per_second` between the reports, and lock your own clock only as
    [`03-collection.md`](03-collection.md#gpu-clocks) describes.
@@ -207,9 +206,9 @@ ncu handles CUDA Graph launches fine — each captured kernel shows up as a sepa
 
 ### "`sm__throughput = X%`, is that good?"
 
-It depends on the kernel type:
-- GEMM / matmul: should be 50%+ on B200 / B300. Below 30% is bad.
-- Element-wise / reduction: usually 10-30%, because they're DRAM-BW-bound.
+It depends on the kernel type and architecture. These rough examples apply to Blackwell only; do not use them as Volta thresholds:
+- GEMM / matmul: often 50%+ on B200 / B300. Below 30% may warrant investigation.
+- Element-wise / reduction: often 10-30% on Blackwell when DRAM bandwidth is the limit.
 - Attention / recurrence kernels: varies wildly; compare against a reference implementation.
 
 Always check Speed-of-Light alongside: `gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed` (reads + writes). If DRAM is saturated, low SM throughput is expected and OK. If DRAM is idle AND SM is idle, you're latency-bound.

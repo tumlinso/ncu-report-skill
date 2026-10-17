@@ -84,7 +84,7 @@ Compile with:
 nvcc -O2 -std=c++17 -lineinfo -arch=sm_100a harness.cu -o harness
 ```
 
-`-arch` is the target GPU's compute capability: `nvidia-smi --query-gpu=compute_cap --format=csv` where the GPU is — 10.0 (B200) is `sm_100a`, 10.3 (B300) is `sm_103a`. The `a` suffix enables the architecture-specific instructions (tcgen05, TMEM) Blackwell kernels use; plain `sm_100` / `sm_103` builds code without them. Name the architecture explicitly rather than `-arch=native`, so the build works on a machine without the GPU.
+For Volta, use a CUDA toolkit that still supports GV100 and compile with `-arch=sm_70`; use Nsight Compute 2025.2.x to profile it. For Blackwell, `-arch=sm_100a` and `sm_103a` target B200 and B300 respectively; the `a` suffix enables Blackwell-specific instructions. Name the target architecture explicitly rather than `-arch=native`, so the build does not depend on the GPU being present during compilation. Set `NCU` to select the intended profiler executable when multiple versions are installed. See [`10-volta.md`](10-volta.md) for SM70 collection and diagnosis limits.
 
 ---
 

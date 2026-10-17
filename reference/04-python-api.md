@@ -2,7 +2,7 @@
 
 Use the Python module, not CLI output, for anything beyond a quick look. The API lets you extract, aggregate, compare, and archive metric data cleanly.
 
-The module ships with Nsight Compute, in `<install>/extras/python`. The helpers' `ncu_utils.py` finds it from the `ncu` on PATH (the same way the CUDA toolkit's `ncu` launcher picks the newest Nsight Compute), so importing `ncu_utils` first is enough:
+The module ships with Nsight Compute, in `<install>/extras/python`. The helpers first honor normal Python import resolution, including `PYTHONPATH`, then discover the selected profiler's module. Set `NCU` to select the profiler executable and optionally set `NCU_REPORT_PYTHON_PATH` to its bindings directory when automatic discovery is not suitable:
 
 ```bash
 python3 <skill>/helpers/ncu_utils.py          # prints where ncu_report was found
@@ -15,7 +15,7 @@ import ncu_utils                               # puts ncu_report on sys.path
 import ncu_report
 ```
 
-The API below is ncu 2026.3's (it reads 2026.1 reports too); `help(ncu_report.IAction)` documents your version.
+The API examples describe newer NCU APIs. Capabilities vary by reader module version; Volta reports use Nsight Compute 2025.2.x. Use `help(ncu_report.IAction)` and capability checks before calling optional methods. Core report loading, action traversal and metric access can work even when newer timeline methods do not exist.
 
 ---
 
@@ -107,7 +107,7 @@ timelines = action.timelines()                     # ITimelines, or None
 aligned = timelines.aligned_metric(m)              # IMetric with aligned instances / correlation ids, or None
 ```
 
-The stall reasons over time are in `action.timed_warp_samples()`: one dict per sample, `{timestamp, pc, stall_reason, not_issued}`, with `stall_reason` an `ncu_report.StallReason_*` code (PmSampling section, in `--set full`). `ncu_utils.warp_state_timeline(action, buckets)` turns them into the share of each reason per time bucket.
+Where the API and report support time-aligned warp samples, `action.timed_warp_samples()` returns records such as `{timestamp, pc, stall_reason, not_issued}`. This is optional and is absent in older APIs; Volta does not support the PM timelines used by this workflow. The helper returns unavailable when this capability is missing. This does not disable SourceCounters-based per-PC analysis when those samples exist.
 
 ---
 
@@ -180,7 +180,7 @@ action.sass_by_pc(pc)           # SASS text of one instruction ("" if none)
 action.ptx_by_pc(pc)            # PTX of one address, when the report has it
 action.source_files()           # {path: content} — content only if collected with --import-source yes
 action.rule_results()           # NCU rule-engine results (IRuleResult objects, below)
-action.timed_warp_samples()     # [{timestamp, pc, stall_reason, not_issued}] from PM sampling
+getattr(action, "timed_warp_samples", None)  # optional API; check before calling
 
 # Metric
 m.value()                       # aggregate value

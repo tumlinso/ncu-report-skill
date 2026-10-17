@@ -1,58 +1,185 @@
-"""Shared helpers for parsing Nsight Compute reports (written against ncu 2026.3, reading 2026.1 reports too).
+"""Shared helpers for parsing reports from multiple Nsight Compute generations.
 
 Usage:
     from ncu_utils import load_report, select_actions, safe, dump_all_metrics
 
-`ncu_report` ships with Nsight Compute under `<install>/extras/python`. If it is
-not importable already, it is found the way the CUDA toolkit's `ncu` launcher
-finds Nsight Compute: from the `ncu` on PATH (the newest install it can reach).
-`python3 ncu_utils.py` prints where it was found.
+`ncu_report` ships with Nsight Compute under `<install>/extras/python`. Standard
+Python import resolution is tried first. Otherwise the selected profiler
+(`NCU_BIN`, `NCU`, or `ncu` on PATH), CUDA roots, and NVIDIA HPC SDK roots are
+used for bounded discovery. `NCU_REPORT_PYTHON_PATH` can name the bindings
+directory explicitly. `python3 ncu_utils.py` prints the selected locations.
 """
 from __future__ import annotations
 
+import importlib
 import json
+import os
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 
 # --- Locate ncu_report -------------------------------------------------------
 
 def _version(path: Path) -> tuple[int, ...]:
-    return tuple(int(x) for x in re.findall(r"\d+", path.name))
+    """Numeric path components, used only to order sibling profiler installs."""
+    return tuple(int(x) for x in re.findall(r"\d+", str(path)))
+
+
+def selected_ncu_executable(environ=None) -> str | None:
+    """Resolve the selected profiler executable, honoring NCU_BIN before NCU."""
+    env = os.environ if environ is None else environ
+    selected = env.get("NCU_BIN") or env.get("NCU") or "ncu"
+    path = Path(selected).expanduser()
+    if path.is_file():
+        return str(path.resolve())
+    return shutil.which(selected)
+
+
+def _has_ncu_report(directory: Path) -> bool:
+    try:
+        return ((directory / "ncu_report.py").is_file()
+                or (directory / "ncu_report" / "__init__.py").is_file())
+    except OSError:
+        return False
+
+
+def _candidate_ncu_python_dirs(ncu_path=None, environ=None) -> list[Path]:
+    """Return likely binding directories, preferring the selected profiler install.
+
+    Searches executable ancestors, CUDA/HPC environment roots, and bounded common
+    installation layouts. It does not recursively walk arbitrary filesystems.
+    """
+    env = os.environ if environ is None else environ
+    explicit_ncu = env.get("NCU_BIN") or env.get("NCU")
+    executable = ncu_path if ncu_path is not None else selected_ncu_executable(env)
+    # An explicitly selected but unresolved profiler must not lead to bindings
+    # being borrowed from a different installation found in a generic root.
+    if ncu_path is None and explicit_ncu and executable is None:
+        return []
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path):
+        path = path.expanduser()
+        try:
+            path = path.resolve()
+        except OSError:
+            pass
+        if path not in seen and _has_ncu_report(path):
+            seen.add(path)
+            candidates.append(path)
+
+    def add_root(root: Path):
+        add(root / "extras" / "python")
+        add(root / "Nsight_Compute" / "extras" / "python")
+        add(root / "nsight-compute" / "extras" / "python")
+        patterns = (
+            "*", "nsight-compute-*", "*/nsight-compute-*",
+            "profilers/*/Nsight_Compute", "*/profilers/*/Nsight_Compute",
+            "*/*/profilers/*/Nsight_Compute",
+        )
+        installs = []
+        for pattern in patterns:
+            try:
+                installs.extend(root.glob(pattern))
+            except OSError:
+                continue
+        for install in sorted(set(installs), key=_version, reverse=True):
+            add(install / "extras" / "python")
+
+    if executable:
+        exe = Path(executable).expanduser()
+        try:
+            exe = exe.resolve()
+        except OSError:
+            pass
+        # Standalone `ncu`, Toolkit `bin/ncu`, and HPC `compilers/bin/ncu`.
+        try:
+            temporary_root = Path(tempfile.gettempdir()).resolve()
+        except OSError:
+            temporary_root = None
+        for ancestor in list(exe.parents)[:4]:
+            if ancestor != Path("/") and ancestor != temporary_root:
+                add_root(ancestor)
+
+    for name in ("CUDA_HOME", "CUDA_PATH", "CUDA_ROOT", "NVHPC", "NVCOMPILERS"):
+        value = env.get(name)
+        if value:
+            add_root(Path(value))
+
+    # Common package-manager and Toolkit prefixes, using bounded globs only.
+    add_root(Path("/opt/nvidia/nsight-compute"))
+    add_root(Path("/usr/local"))
+    try:
+        roots = sorted(Path("/usr/local").glob("cuda*"), key=_version, reverse=True)
+    except OSError:
+        roots = []
+    for root in roots:
+        add_root(root)
+    return candidates
 
 
 def ncu_python_dir() -> Path | None:
-    """`<Nsight Compute install>/extras/python` for the `ncu` on PATH, or None."""
-    ncu = shutil.which("ncu")
-    if ncu is None:
-        return None
-    real = Path(ncu).resolve()
-    if (real.parent / "extras/python/ncu_report.py").is_file():
-        return real.parent / "extras/python"
-    # The CUDA toolkit's `ncu` is a launcher script: it runs the newest Nsight Compute
-    # of the .deb/.rpm installs (/opt/nvidia/nsight-compute/<version>) and of the
-    # .run installs next to the toolkit (<toolkit>/nsight-compute-<version>).
-    installs = [*Path("/opt/nvidia/nsight-compute").glob("*"),
-                *real.parent.parent.glob("nsight-compute-*")]
-    installs = [d for d in installs if (d / "extras/python/ncu_report.py").is_file()]
-    if not installs:
-        return None
-    return max(installs, key=_version) / "extras/python"
+    """Return the discovered Nsight Compute Python binding directory, if any."""
+    candidates = _candidate_ncu_python_dirs()
+    return candidates[0] if candidates else None
 
 
-try:
-    import ncu_report  # noqa: F401
-except ImportError:
-    _found = ncu_python_dir()
-    if _found is None:
+def _import_from_directory(directory: Path):
+    path = str(directory.resolve())
+    sys.path.insert(0, path)
+    try:
+        return importlib.import_module("ncu_report")
+    except ImportError as exc:
         raise ImportError(
-            "ncu_report is not importable and no Nsight Compute install was found from the "
-            "`ncu` on PATH: put <Nsight Compute install>/extras/python on PYTHONPATH"
+            f"Unable to import ncu_report from {path}: {exc}. Check that the Nsight "
+            "Compute Python bindings match this Python interpreter."
+        ) from exc
+
+
+def _load_ncu_report():
+    """Import ncu_report via normal Python resolution, override, then discovery."""
+    try:
+        return importlib.import_module("ncu_report")
+    except ModuleNotFoundError as exc:
+        if exc.name != "ncu_report":
+            raise ImportError(
+                f"Python found ncu_report but could not load one of its dependencies: {exc}. "
+                "Check that PYTHONPATH points to bindings compatible with this interpreter."
+            ) from exc
+    except ImportError as exc:
+        raise ImportError(
+            f"Python found ncu_report but could not import it: {exc}. Check that PYTHONPATH "
+            "points to bindings compatible with this interpreter."
+        ) from exc
+
+    override = os.environ.get("NCU_REPORT_PYTHON_PATH")
+    if override is not None:
+        path = Path(override).expanduser()
+        if not path.is_dir() or not _has_ncu_report(path):
+            raise ImportError(
+                "NCU_REPORT_PYTHON_PATH is set but does not contain ncu_report: "
+                f"{path}. Set it to the Nsight Compute extras/python directory."
+            ) from None
+        return _import_from_directory(path)
+
+    found = ncu_python_dir()
+    if found is None:
+        selected = (os.environ.get("NCU_BIN") or os.environ.get("NCU")
+                    or selected_ncu_executable() or "not found on PATH")
+        raise ImportError(
+            "ncu_report is not importable and no Nsight Compute bindings were found "
+            f"for the selected profiler ({selected}). Set NCU_REPORT_PYTHON_PATH or "
+            "add <Nsight Compute install>/extras/python to PYTHONPATH. Select the "
+            "profiler with NCU_BIN or NCU."
         ) from None
-    sys.path.insert(0, str(_found))
-    import ncu_report  # noqa: F401
+    return _import_from_directory(found)
+
+
+ncu_report = _load_ncu_report()
 
 
 # --- Loading -----------------------------------------------------------------
@@ -225,7 +352,10 @@ def per_pc_values(action, metric_name):
         try:
             v = metric_value_at(m, i)
         except Exception:
-            v = 0
+            # An unreadable sample is missing evidence, not a measured zero.
+            continue
+        if v is None:
+            continue
         out.append((pc, v))
     return out
 
@@ -246,10 +376,9 @@ def pc_to_source_line(action, pc):
 
 # --- Curated metric sets -----------------------------------------------------
 #
-# Every name below is collected by `ncu --set full` (ncu 2026.1 and 2026.3) on Blackwell
-# (sm_100 / sm_103). For a fuller list and rationale see
-# ../reference/08-metric-names.md. Other GPU generations and future ncu releases
-# may need alternate names: verify with action.metric_names() if one is None.
+# Curated names span several architectures. A metric that is not collected by a
+# report stays `None`; the full archive preserves every metric the report has.
+# For a fuller list and rationale see ../reference/08-metric-names.md.
 
 KEY_METRICS = [
     # Launch geometry
@@ -285,17 +414,24 @@ KEY_METRICS = [
     "sm__warps_active.max.per_cycle_active",
     "sm__warps_active.min.per_cycle_active",
     "smsp__warps_active.avg.per_cycle_active",
+    "smsp__warps_active.avg.peak_sustained",
     "smsp__warps_eligible.avg.per_cycle_active",
     "smsp__warps_eligible.max.per_cycle_active",
     # IPC
     "sm__inst_executed.avg.per_cycle_active",
     "smsp__issue_active.avg.per_cycle_active",
     "smsp__issue_active.avg.pct_of_peak_sustained_active",
+    "smsp__issue_inst0.avg.pct_of_peak_sustained_active",
     "smsp__inst_executed.avg",
     # Compute pipes
     "sm__inst_executed_pipe_fma.avg.pct_of_peak_sustained_active",
     "sm__inst_executed_pipe_fma.avg.pct_of_peak_sustained_elapsed",
     "sm__inst_executed_pipe_alu.avg.pct_of_peak_sustained_active",
+    # FP16/FP64 pipe views exposed by the 2025.2 ComputeWorkloadAnalysis section.
+    "sm__inst_executed_pipe_fp16.avg.pct_of_peak_sustained_active",
+    "sm__inst_executed_pipe_fma_type_fp16.avg.pct_of_peak_sustained_active",
+    "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_active",
+    "sm__inst_executed_pipe_fp64.avg.pct_of_peak_sustained_active",
     "sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_active",
     "sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_elapsed",
     "sm__inst_executed_pipe_xu.avg.pct_of_peak_sustained_active",
@@ -303,6 +439,22 @@ KEY_METRICS = [
     # Tensor core
     "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active",
     "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
+    # Versioned HMMA views remain separate because their definitions can differ.
+    "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_active",
+    "sm__pipe_tensor_op_hmma_cycles_active_v2.avg.pct_of_peak_sustained_active",
+    "sm__inst_executed_pipe_tensor_op_hmma.avg.pct_of_peak_sustained_active",
+    "sm__inst_executed_pipe_tensor_op_hmma_v2.avg.pct_of_peak_sustained_active",
+    "sm__inst_executed_pipe_tensor_subpipe_hmma.avg.pct_of_peak_sustained_active",
+    # Shared-memory SourceCounters views, when that source-level data is exposed.
+    "derived__memory_l1_wavefronts_shared_excessive",
+    "derived__memory_l1_conflicts_shared_nway",
+    "memory_l1_wavefronts_shared",
+    "memory_l1_wavefronts_shared_ideal",
+    # SharedMemoryConflicts section keeps load and store counters distinct.
+    "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum",
+    "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum",
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum",
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum",
     "sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.avg",
     "sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.avg.pct_of_peak_sustained_elapsed",
     "sm__mem_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
@@ -403,23 +555,119 @@ def rule_speedups(action):
     the part the rule is about, "global": of the whole kernel), severity
     (OPT/WRN/INF/OK/ERR), section, rule, title, message.
     """
+    return rule_speedups_result(action)[0]
+
+
+def rule_speedups_result(action):
+    """Return ``(results, status, error)`` for optional report rule processing.
+
+    Status is ``available``, ``no_results``, ``unsupported`` or ``error``. The
+    report API does not distinguish an untriggered rule from omitted rule data;
+    ``no_results`` therefore makes no claim about why the list is empty.
+    """
+    method = getattr(action, "rule_results", None)
+    if not callable(method):
+        return [], "unsupported", None
+    try:
+        report_results = method()
+    except Exception as exc:
+        return [], "error", str(exc)
+    if report_results is None:
+        return [], "no_results", None
     out = []
-    for rr in action.rule_results():
-        est = rr.speedup_estimation() if rr.has_speedup_estimation() else {}
-        msg = rr.rule_message() if rr.has_rule_message() else {}
-        if not msg.get("message") and not est:
-            continue
-        out.append({
-            "speedup": est.get("speedup"),
-            "speedup_type": _SPEEDUP_TYPE.get(est.get("type")),
-            "severity": _SEVERITY.get(msg.get("type"), "?"),
-            "section": rr.section_identifier(),
-            "rule": rr.rule_identifier(),
-            "title": msg.get("title", ""),
-            "message": _plain(msg.get("message", "")),
-        })
+    try:
+        for rr in report_results:
+            est = rr.speedup_estimation() if rr.has_speedup_estimation() else {}
+            msg = rr.rule_message() if rr.has_rule_message() else {}
+            if not msg.get("message") and not est:
+                continue
+            out.append({
+                "speedup": est.get("speedup"),
+                "speedup_type": _SPEEDUP_TYPE.get(est.get("type")),
+                "severity": _SEVERITY.get(msg.get("type"), "?"),
+                "section": rr.section_identifier(),
+                "rule": rr.rule_identifier(),
+                "title": msg.get("title", ""),
+                "message": _plain(msg.get("message", "")),
+            })
+    except Exception as exc:
+        return [], "error", str(exc)
     out.sort(key=lambda r: -(r["speedup"] or 0.0))
-    return out
+    return out, ("available" if out else "no_results"), None
+
+
+def action_architecture(action) -> str:
+    """Return a stable ``sm_<major><minor>`` label, or ``unknown``."""
+    major = safe(action, "device__attribute_compute_capability_major")
+    minor = safe(action, "device__attribute_compute_capability_minor")
+    try:
+        return f"sm_{int(major)}{int(minor)}"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def timed_warp_sample_info(action):
+    """Return ``(status, count, error)`` for the optional timed warp-sample API."""
+    status, samples, error = _timed_warp_samples(action)
+    return status, (len(samples) if samples is not None else None), error
+
+
+def _timed_warp_samples(action):
+    """Read optional timed warp samples and keep unsupported distinct from empty."""
+    method = getattr(action, "timed_warp_samples", None)
+    if not callable(method):
+        return "unsupported", None, None
+    try:
+        samples = method()
+    except Exception as exc:
+        return "error", None, str(exc)
+    if not samples:
+        return "no_data", [], None
+    return "available", samples, None
+
+
+def report_metadata(report, action, rule_summary=None):
+    """Summarize report identity and which evidence is present for an action."""
+    try:
+        metric_names = set(action.metric_names())
+    except Exception:
+        metric_names = set()
+    try:
+        reader_path = str(Path(ncu_report.__file__).resolve())
+    except (AttributeError, OSError):
+        reader_path = "ncu_report (Python import)"
+    get_version = getattr(report, "get_version", None) if report is not None else None
+    try:
+        reader_version = str(get_version()) if callable(get_version) else None
+    except Exception:
+        reader_version = None
+    source_metrics = sorted(n for n in metric_names if n.startswith("smsp__pcsamp_"))
+    warp_status, warp_count, warp_error = timed_warp_sample_info(action)
+    if rule_summary is None:
+        rule_results, rule_status, rule_error = rule_speedups_result(action)
+    else:
+        rule_results, rule_status, rule_error = rule_summary
+    return {
+        "architecture": action_architecture(action),
+        # The reader API does not document a report-producer version field.
+        # Keep this unknown instead of relabeling the reader/library version.
+        "producer_profiler_version": None,
+        "producer_profiler_version_status": "unknown; not exposed as report metadata",
+        "reader_api": {"module": "ncu_report", "path": reader_path,
+                        "version": reader_version},
+        "measurements": {
+            "report_metric_count": len(metric_names),
+            "curated_metric_count": len(KEY_METRICS),
+            "curated_metrics_present": sum(name in metric_names for name in KEY_METRICS),
+            "curated_metrics_missing": sum(name not in metric_names for name in KEY_METRICS),
+            "source_stall_metrics_present": source_metrics,
+            "pm_sampling_series_count": len(pm_series_names(action)),
+            "timed_warp_samples": {"status": warp_status, "count": warp_count,
+                                   "error": warp_error},
+            "rule_results": {"status": rule_status, "count": len(rule_results),
+                             "error": rule_error},
+        },
+    }
 
 
 # --- PM sampling time series -----------------------------------------------------
@@ -444,28 +692,56 @@ def pm_series_names(action):
     return sorted(out)
 
 
-def pm_series(action, name):
-    """(timestamps_ns, values) of one PM-sampling series, or None.
+def pm_series_result(action, name):
+    """Return ``(series, status, error)`` without requiring timeline APIs.
 
-    With ncu_report 2026.3+ the series is aligned to the workload's timestamps
-    (`action.timelines().aligned_metric`, context-switch filtered), else it is raw.
+    Legacy report APIs may provide useful unaligned PM samples. If optional
+    timeline alignment is missing or fails, the raw series is returned.
     """
     try:
-        m = action[name]
-    except Exception:
-        return None
-    timelines = action.timelines() if hasattr(action, "timelines") else None
-    if timelines is not None:
-        m = timelines.aligned_metric(m) or m
-    n = m.num_instances()
-    if n < 2:
-        return None
-    vals = [metric_value_at(m, i) for i in range(n)]
-    ts = None
-    if m.has_correlation_ids():
-        cor = m.correlation_ids()
-        ts = [cor.as_uint64(i) for i in range(n)]
-    return ts, vals
+        names = set(action.metric_names())
+    except Exception as exc:
+        return None, "error", str(exc)
+    if name not in names:
+        return None, "missing", None
+    try:
+        metric = action[name]
+    except Exception as exc:
+        return None, "error", str(exc)
+
+    status, error = "raw", None
+    timelines_method = getattr(action, "timelines", None)
+    if callable(timelines_method):
+        try:
+            timelines = timelines_method()
+        except Exception as exc:
+            timelines, status, error = None, "alignment_error", str(exc)
+        align = getattr(timelines, "aligned_metric", None) if timelines is not None else None
+        if callable(align):
+            try:
+                aligned = align(metric)
+                if aligned is not None:
+                    metric, status = aligned, "aligned"
+            except Exception as exc:
+                status, error = "alignment_error", str(exc)
+
+    try:
+        count = metric.num_instances()
+        if count < 2:
+            return None, "no_data", error
+        values = [metric_value_at(metric, i) for i in range(count)]
+        timestamps = None
+        if metric.has_correlation_ids():
+            correlations = metric.correlation_ids()
+            timestamps = [correlations.as_uint64(i) for i in range(count)]
+        return (timestamps, values), status, error
+    except Exception as exc:
+        return None, "error", str(exc)
+
+
+def pm_series(action, name):
+    """(timestamps_ns, values) of one PM-sampling series, or None."""
+    return pm_series_result(action, name)[0]
 
 
 def stall_reason_names():
@@ -474,25 +750,38 @@ def stall_reason_names():
             for k in dir(ncu_report) if k.startswith("StallReason_")}
 
 
-def warp_state_timeline(action, buckets):
+def warp_state_timeline_result(action, buckets):
     """Stall reasons over the kernel's run, from its timed warp samples (PmSampling).
 
-    Returns (span_ns, {reason: [share of the samples in each time bucket]}), or None
-    when the report has no timed warp samples.
+    Return ``(timeline, status, error)`` so missing API, absent samples and errors
+    remain distinct for callers that want to explain unavailable analysis.
     """
-    samples = action.timed_warp_samples()
-    if not samples:
-        return None
-    t0 = min(s["timestamp"] for s in samples)
-    span = max(s["timestamp"] for s in samples) - t0 or 1
-    names = stall_reason_names()
-    counts, totals = {}, [0] * buckets
-    for s in samples:
-        b = min(buckets - 1, (s["timestamp"] - t0) * buckets // span)
-        totals[b] += 1
-        reason = names.get(s["stall_reason"], str(s["stall_reason"]))
-        counts.setdefault(reason, [0] * buckets)[b] += 1
-    return span, {r: [c / t if t else 0.0 for c, t in zip(cs, totals)] for r, cs in counts.items()}
+    status, samples, error = _timed_warp_samples(action)
+    if status != "available":
+        return None, status, error
+    if buckets <= 0:
+        return None, "error", "bucket count must be positive"
+    try:
+        t0 = min(sample["timestamp"] for sample in samples)
+        span = max(sample["timestamp"] for sample in samples) - t0 or 1
+        names = stall_reason_names()
+        counts, totals = {}, [0] * buckets
+        for sample in samples:
+            bucket = min(buckets - 1, (sample["timestamp"] - t0) * buckets // span)
+            totals[bucket] += 1
+            reason = names.get(sample["stall_reason"], str(sample["stall_reason"]))
+            counts.setdefault(reason, [0] * buckets)[bucket] += 1
+        timeline = (span, {reason: [count / total if total else 0.0
+                                   for count, total in zip(values, totals)]
+                           for reason, values in counts.items()})
+        return timeline, status, None
+    except Exception as exc:
+        return None, "error", str(exc)
+
+
+def warp_state_timeline(action, buckets):
+    """Return a timed stall timeline, or None when unsupported or unavailable."""
+    return warp_state_timeline_result(action, buckets)[0]
 
 
 # --- Inlined source lines (for CUTLASS/CuTe-style kernels) ---------------------
@@ -609,4 +898,4 @@ def inline_chains(action, binary):
 
 if __name__ == "__main__":
     print(f"ncu_report: {Path(ncu_report.__file__).parent}")
-    print(f"ncu: {shutil.which('ncu')}")
+    print(f"ncu: {selected_ncu_executable() or 'not found'}")

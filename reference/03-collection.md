@@ -1,6 +1,6 @@
 # Profile Collection Commands
 
-This document lists the exact `ncu` commands you should run, in what order, and what each flag does. They are written against Nsight Compute 2026.3 (differences from 2026.1, which CUDA 13.2 bundles, are noted); `ncu --help`, `ncu --list-sets` and `ncu --list-sections` show what your version has.
+This document lists portable Nsight Compute commands. Blackwell-specific section details target 2026.3; Volta requires 2025.2.x. Select the intended executable explicitly with `NCU` (default `ncu`) and inspect `"$NCU" --help`, `"$NCU" --list-sets`, and `"$NCU" --list-sections` before using version-sensitive options.
 
 ---
 
@@ -8,6 +8,8 @@ This document lists the exact `ncu` commands you should run, in what order, and 
 
 - Line info in the kernel: `-lineinfo` in the compile flags, or a prebuilt binary that has it (see `02-harness-guide.md`).
 - `ncu` available on PATH.
+- Set `NCU` to the profiler executable to use when more than one is installed; recipes use `NCU="${NCU:-ncu}"`.
+- Optionally select `CLOCK_CONTROL` from `"$NCU" --help`. Nsight Compute 2025.2 supports `base`, `none`, and `reset`; newer releases may offer `boost`. Leave it unset to preserve that profiler's default; for an explicit policy, use `base` for 2025.2 or `boost` on a newer profiler that lists it, then record the choice.
 - Writable `$HOME` so ncu can cache section files.
 - Kernel name known (`cuobjdump -res-usage <binary> | grep Function`, or the survey below).
 - ncu launches the program itself, not a launcher around it. `ncu ... uv run python app.py` hangs (no kernel is ever profiled, in ncu 2026.1 and 2026.3 alike): put ncu inside the launcher, `uv run ncu ... python app.py`, or give ncu the interpreter, `ncu ... .venv/bin/python app.py`. The same goes for other launchers that start the interpreter as a child process.
@@ -16,7 +18,9 @@ Every `ncu` command below that runs a program needs the GPU; `ncu --import` does
 
 Quick permission test:
 ```bash
-ncu --section SpeedOfLight -k "regex:YOUR_KERNEL_NAME" -c 1 ./harness [args]
+export NCU="${NCU:-ncu}"
+"$NCU" --version
+"$NCU" --section SpeedOfLight -k "regex:YOUR_KERNEL_NAME" -c 1 ./harness [args]
 # If you see ERR_NVGPUCTRPERM: see 09-common-issues.md.
 # If you see the SpeedOfLight table and "regex" matched, you're good.
 ```
@@ -28,14 +32,16 @@ ncu --section SpeedOfLight -k "regex:YOUR_KERNEL_NAME" -c 1 ./harness [args]
 Before profiling in depth, list every kernel a call launches with its duration and clock (cheap: one pass per kernel):
 
 ```bash
-ncu --metrics gpu__time_duration.sum,sm__cycles_elapsed.avg.per_second \
+export NCU="${NCU:-ncu}"
+"$NCU" --metrics gpu__time_duration.sum,sm__cycles_elapsed.avg.per_second \
     -o "$PROFILE_RUN_DIR/reports/survey_<tag>.ncu-rep" ./harness [args]
 ```
 
 Read it as one table per kernel:
 
 ```bash
-ncu --import "$PROFILE_RUN_DIR/reports/survey_<tag>.ncu-rep" --print-summary per-kernel --print-kernel-base function
+export NCU="${NCU:-ncu}"
+"$NCU" --import "$PROFILE_RUN_DIR/reports/survey_<tag>.ncu-rep" --print-summary per-kernel --print-kernel-base function
 ```
 
 Each entry has the kernel's function name (what `-k` matches), its launch shape, the number of invocations and the metrics: pick the kernel and the regex for `-k` from here.
@@ -44,12 +50,14 @@ Each entry has the kernel's function name (what `-k` matches), its launch shape,
 
 ## Recipe 1: Full profile (the one report the analysis needs)
 
-Collects every standard section — SOL, occupancy, memory, compute, scheduler, warp state, the per-PC stall samples (SourceCounters) and the PM-sampling timelines and timed warp samples (PmSampling):
+Collects the standard sections available for the selected GPU, including the per-PC stall samples where supported. PM-sampling timelines and timed warp samples are hardware- and version-dependent; Volta does not provide the PM timelines used by the Blackwell workflow. Their absence does not prevent other analyses.
 
 ```bash
-ncu --set full \
+export NCU="${NCU:-ncu}"
+CLOCK_ARGS=()
+if [[ -n "${CLOCK_CONTROL:-}" ]]; then CLOCK_ARGS=(--clock-control "$CLOCK_CONTROL"); fi
+"$NCU" --set full "${CLOCK_ARGS[@]}" \
     --import-source yes \
-    --clock-control boost \
     -k "regex:KERNEL_REGEX" \
     -c 1 \
     -o "$PROFILE_RUN_DIR/reports/full_<tag>.ncu-rep" \
@@ -58,8 +66,8 @@ ncu --set full \
 
 | Flag | Meaning |
 |---|---|
-| `--set full` | Every built-in section, including `SourceCounters` and `PmSampling` |
-| `--clock-control boost` | Locks the clock at boost for each profiled kernel (the default in ncu 2026.1–2026.3); named so the command records it. See [GPU clocks](#gpu-clocks) |
+| `--set full` | Requests all built-in sections supported by the selected profiler and GPU; individual sections or data can be unavailable |
+| optional clock policy | Set `CLOCK_CONTROL` to a value listed by the selected profiler; unset preserves its default. See [GPU clocks](#gpu-clocks) |
 | `--import-source yes` | Embeds the CUDA source files into the report, so the source view works where the source is not (another machine, a container). The files are read where ncu runs, at collection only (it cannot be added to an existing report): when the paths recorded by the build do not exist there, pass `--source-folders DIR,...` with directories visible to that machine or container |
 | `-k "regex:..."` | Only profile kernels whose name matches: the function name by default (`my_kernel`), the full demangled name (`void my_kernel<(int)8>(float *)`) with `--kernel-name-base demangled`. Reduces replay count. |
 | `-c 1` | Only profile the first matching kernel launch. Avoids duplicates when the kernel is called in a loop. |
@@ -74,7 +82,8 @@ The kernel is replayed dozens of times (one pass per metric group): seconds for 
 Per-PC stall sampling alone, a few passes. Use it after a code change, when only the hot lines matter:
 
 ```bash
-ncu --section SourceCounters \
+export NCU="${NCU:-ncu}"
+"$NCU" --section SourceCounters \
     -k "regex:KERNEL_REGEX" \
     -c 1 \
     -o "$PROFILE_RUN_DIR/reports/source_<tag>.ncu-rep" \
@@ -90,7 +99,8 @@ ncu --section SourceCounters \
 No need to collect again — just import an existing `full_<tag>.ncu-rep`:
 
 ```bash
-ncu --import "$PROFILE_RUN_DIR/reports/full_<tag>.ncu-rep" --page details > "$PROFILE_RUN_DIR/analysis/details_<tag>.txt"
+export NCU="${NCU:-ncu}"
+"$NCU" --import "$PROFILE_RUN_DIR/reports/full_<tag>.ncu-rep" --page details > "$PROFILE_RUN_DIR/analysis/details_<tag>.txt"
 ```
 
 This produces NCU's human-readable details page, including the built-in rule-engine suggestions. Each rule looks like:
@@ -110,12 +120,13 @@ OPT   Est. Speedup: <pct>%
 ## Recipe 4: CSV / raw export (scripting)
 
 ```bash
+export NCU="${NCU:-ncu}"
 # Full metric table as CSV — one row per kernel launch, one column per metric
-ncu --import "$PROFILE_RUN_DIR/reports/full_<tag>.ncu-rep" --page raw --csv > "$PROFILE_RUN_DIR/analysis/raw_<tag>.csv"
+"$NCU" --import "$PROFILE_RUN_DIR/reports/full_<tag>.ncu-rep" --page raw --csv > "$PROFILE_RUN_DIR/analysis/raw_<tag>.csv"
 
 # Source page as text: CUDA lines interleaved with their SASS and its per-instruction counters
 # (--print-source cuda alone prints the source without counters)
-ncu --import "$PROFILE_RUN_DIR/reports/full_<tag>.ncu-rep" --page source --print-source cuda,sass > "$PROFILE_RUN_DIR/analysis/source_<tag>.txt"
+"$NCU" --import "$PROFILE_RUN_DIR/reports/full_<tag>.ncu-rep" --page source --print-source cuda,sass > "$PROFILE_RUN_DIR/analysis/source_<tag>.txt"
 ```
 
 Most of the time you don't need these — the Python API (`04-python-api.md`) is easier. But CSV is handy for quick `grep`/`awk` one-liners.
@@ -127,7 +138,8 @@ Most of the time you don't need these — the Python API (`04-python-api.md`) is
 If you already know which metrics you want (e.g., you're re-running after a code change and only want to check if the fix worked), collect just those:
 
 ```bash
-ncu --metrics \
+export NCU="${NCU:-ncu}"
+"$NCU" --metrics \
     gpu__time_duration.sum,\
     sm__cycles_elapsed.avg.per_second,\
     sm__throughput.avg.pct_of_peak_sustained_elapsed,\
@@ -147,12 +159,15 @@ Takes one or two replay passes. Prints a table directly to stdout. No `-o` outpu
 ## Recipe 6: A/B comparison (before vs after optimization)
 
 ```bash
+export NCU="${NCU:-ncu}"
+CLOCK_ARGS=()
+if [[ -n "${CLOCK_CONTROL:-}" ]]; then CLOCK_ARGS=(--clock-control "$CLOCK_CONTROL"); fi
 # Before
-ncu --set full --import-source yes --clock-control boost -k "regex:my_kernel" -c 1 \
+"$NCU" --set full --import-source yes "${CLOCK_ARGS[@]}" -k "regex:my_kernel" -c 1 \
     -o "$PROFILE_RUN_DIR/reports/v1.ncu-rep" ./harness_v1 [args]
 
 # After: the same options, so the reports compare
-ncu --set full --import-source yes --clock-control boost -k "regex:my_kernel" -c 1 \
+"$NCU" --set full --import-source yes "${CLOCK_ARGS[@]}" -k "regex:my_kernel" -c 1 \
     -o "$PROFILE_RUN_DIR/reports/v2.ncu-rep" ./harness_v2 [args]
 ```
 
@@ -174,8 +189,9 @@ Compare reports collected at the same clock (`--clock-control`, below).
 ## What each `--set` contains
 
 ```bash
-ncu --list-sets           # list all sets
-ncu --list-sections       # list all sections
+export NCU="${NCU:-ncu}"
+"$NCU" --list-sets           # list all sets
+"$NCU" --list-sections       # list all sections
 ```
 
 ncu 2026.3:
@@ -211,7 +227,8 @@ If the kernel is called multiple times and you want different iterations:
 
 ```bash
 # Skip the first 5 invocations, then profile 3 consecutive launches
-ncu -k "regex:my_kernel" -s 5 -c 3 -o report.ncu-rep ./harness
+export NCU="${NCU:-ncu}"
+"$NCU" -k "regex:my_kernel" -s 5 -c 3 -o report.ncu-rep ./harness
 ```
 
 `-s N` skips the first N matches. `-c N` limits to N matches. Useful for ignoring warmup or focusing on a steady-state iteration. For a program that warms up first (JIT, autotuning), `--profile-from-start off` plus a profiler range around the call you want (`cudaProfilerStart/Stop`, `torch.cuda.profiler.start()/stop()`) profiles only that call.
@@ -222,18 +239,16 @@ A report with several launches holds one action per launch; the helpers analyze 
 
 ## GPU clocks
 
-ncu fixes the clock itself: it locks the GPU clock for every profiled kernel and restores it after, so durations and
-throughputs are comparable between runs. The default is `--clock-control boost` in ncu 2026.1–2026.3 and `base` in older
-versions (`ncu --help` shows it); on a B300, `base` (~1.06 GHz) made kernels ~1.7x slower than `boost` (~2.0 GHz).
-Name the setting in the command so the report says what it ran at. No outer lock is needed.
+The clock policy is profiler-version dependent. Read `"$NCU" --help` and choose only an option it lists. Nsight Compute 2025.2 supports `base`, `none`, and `reset`; newer versions may also support `boost`. Leave `CLOCK_CONTROL` unset to retain the profiler default. For an explicit comparable policy, set `CLOCK_CONTROL=base` for 2025.2 or `CLOCK_CONTROL=boost` on a newer release when supported. Record the selected/default policy and actual clock. Do not assume that different policies give comparable durations.
 
 To profile at a fixed clock of your own (to match the clock a timing A/B ran at), lock it around the command and pass
 `--clock-control none`; without it, ncu replaces your lock with its own:
 
 ```bash
+export NCU="${NCU:-ncu}"
 # or lock it the way your system provides; check with nvidia-smi -q -d CLOCK
 sudo nvidia-smi -lgc <mhz>,<mhz>
-ncu --clock-control none --set full ... ./harness [args]
+"$NCU" --clock-control none --set full ... ./harness [args]
 sudo nvidia-smi -rgc
 ```
 
@@ -246,5 +261,5 @@ Read the clock a report ran at from `sm__cycles_elapsed.avg.per_second` (in `met
 - **Profile run time blows up with `--set full`**: that's normal, each replay is a full kernel execution.
 - **`regex:...` doesn't match anything**: `-k` matches the kernel's function name by default (`--kernel-name-base function`): `my_kernel` for `void my_kernel<(int)8, (int)256>(float *)`. To tell template instances apart, add `--kernel-name-base demangled` and match the full name. List the names with the survey (Recipe 0) or `cuobjdump -res-usage ./harness | grep Function | cu++filt`.
 - **No report file**: ncu writes none when it profiled nothing (`==WARNING== No kernels were profiled.`): the `-k` regex didn't match, `-c`/`--launch-skip` skipped past the launches, or the program exited before the kernel ran. ncu does not overwrite an existing report either (`==ERROR== File ... already exists`): pass `-f`, or give each run its own name.
-- **PM Sampling returns nothing**: check the report came from `--set full` (or `--section PmSampling`) and the GPU isn't a vGPU (vGPU doesn't support PM sampling). `plot_timeline.py --list` shows the series a report has.
+- **PM sampling returns nothing**: check whether the GPU and profiler support the requested PM section and whether it was collected. Volta does not support these PM-sampling timelines; this is expected and does not block static counters or source-counter analysis. `plot_timeline.py --list` shows series when present.
 - **"Could not deploy stock section files to $HOME"**: set `HOME` to a writable directory first.

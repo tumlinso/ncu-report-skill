@@ -2,6 +2,11 @@
 
 Metric names change between GPU generations and Nsight Compute releases, and many older docs use names that `--set full` does not collect on Blackwell. This doc lists the names a `--set full` report holds with Nsight Compute 2026.3 (and 2026.1, where the PM-sampling names below differ) on B200 / B300 (sm_100 / sm_103), and what to use instead of the older names.
 
+This is a Blackwell metric reference, not a cross-architecture contract. For
+GV100 / SM70 examples and interpretation, see [`10-volta.md`](10-volta.md).
+Query the selected profiler and inspect the metrics in the report before
+interpreting a missing name.
+
 If a metric returns `None` on your kernel, first check this doc, then enumerate the names the report has:
 
 ```python
@@ -206,7 +211,7 @@ SM_A.TriageCompute.sm__mem_tensor_cycles_active_realtime.avg.pct_of_peak_sustain
 SM_A.TriageCompute.l1tex__throughput.avg.pct_of_peak_sustained_elapsed    # 2026.1 only
 ```
 
-ncu 2026.3 has no stall-reason PM series: the stall reasons over time come from the timed warp samples (`action.timed_warp_samples()`, PmSampling section), which `plot_timeline.py` plots. ncu 2026.1's PmSampling_WarpStates section (`--section PmSampling_WarpStates`, removed in 2026.3) gave them as series:
+On supported GPUs, ncu 2026.3 has no stall-reason PM series: stall reasons over time come from the optional timed warp samples (`action.timed_warp_samples()`, PmSampling section), which `plot_timeline.py` plots. This method is not present in all report APIs, and Volta does not support these PM timelines. ncu 2026.1's PmSampling_WarpStates section (`--section PmSampling_WarpStates`, removed in 2026.3) gave them as series:
 ```
 pmsampling:smsp__warps_issue_stalled_long_scoreboard.avg
 pmsampling:smsp__warps_issue_stalled_short_scoreboard.avg
