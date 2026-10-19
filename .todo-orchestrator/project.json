@@ -1,18 +1,1 @@
-{
-  "configuration": {
-    "busy_timeout_ms": 5000,
-    "claim_lease_seconds": 7200,
-    "context_budget_bytes": 12000,
-    "legacy_review_days": {
-      "blocked": 7,
-      "in_progress": 3,
-      "planned": 3,
-      "stale": 3
-    },
-    "resource_lease_seconds": 300
-  },
-  "created_at": "2026-10-17T15:14:36Z",
-  "project_name": "ncu-report-skill",
-  "project_uuid": "f4adfb68-0adb-47cd-9442-da2052279559",
-  "schema_version": 2
-}
+{"authority_id":"6101668a-b492-522e-af69-fb2c05bd4b71","authority_path":".todo-orchestrator/authority.sqlite3","format":"todo-orchestrator.project-metadata","project_id":"f4adfb68-0adb-47cd-9442-da2052279559","repository_id":"ncu-report-skill","version":1}
